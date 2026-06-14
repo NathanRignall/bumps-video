@@ -79,7 +79,16 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
     // (which then drops whole frames at the source, intentionally) rather than
     // silently shredding the MPEG-TS bytestream mid-packet.
     let queue_srt = make_queue("q_srt", false)?;
-    let mpegts = make("mpegtsmux", "ts")?;
+    // `enable-custom-mappings=true` lets the muxer accept codecs whose
+    // MPEG-TS stream-type mapping isn't in the base spec yet, in particular
+    // AV1. Harmless for HEVC and H.264 (their mappings are standard) and
+    // required for AV1 — without it the muxer errors:
+    //   "Failed to determine stream type or mapping is not supported"
+    let mpegts = gstreamer::ElementFactory::make("mpegtsmux")
+        .name("ts")
+        .property("enable-custom-mappings", true)
+        .build()
+        .context("mpegtsmux factory")?;
     let srtsink = gstreamer::ElementFactory::make("srtsink")
         .name("uplink")
         .property("uri", &cfg.srt_uri)
