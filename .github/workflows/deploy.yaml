@@ -1,0 +1,42 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+
+      - name: Authenticate to Vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: https://vault.rignall.uk
+          method: jwt
+          path: github
+          role: app-bumps-video
+          jwtGithubAudience: vault
+          exportToken: true
+          secrets: |
+            aws/sts/app-bumps-video access_key | AWS_ACCESS_KEY_ID ;
+            aws/sts/app-bumps-video secret_key | AWS_SECRET_ACCESS_KEY ;
+            aws/sts/app-bumps-video security_token | AWS_SESSION_TOKEN
+
+      - name: Terraform Init
+        run: nix shell nixpkgs#opentofu -c tofu -chdir=terraform init
+
+      - name: Terraform Plan
+        run: nix shell nixpkgs#opentofu -c tofu -chdir=terraform plan
+
+      - name: Terraform Apply
+        run: nix shell nixpkgs#opentofu -c tofu -chdir=terraform apply -auto-approve

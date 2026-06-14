@@ -1,0 +1,62 @@
+# =============================================================================
+# AWS MediaConnect SRT relay
+# =============================================================================
+#
+# Topology:
+#
+#   [bumps-pipe field laptop]
+#            │  SRT caller, encoded HEVC
+#            ▼
+#   [MediaConnect Flow Source — srt-listener :9999]
+#            │
+#            ▼
+#   [MediaConnect Flow Output — srt-listener :9998]
+#            ▲
+#            │  SRT caller, into OBS or `ffplay`
+#   [Home PC / OBS]
+#
+# Both ends of MediaConnect are *listeners* so the field laptop and the home
+# PC don't need to be reachable from the public internet (no port-forwarding,
+# no dynamic-DNS for residential IPs). MediaConnect itself is the central
+# meeting point with stable, region-pinned addresses.
+#
+# Cost note: a running MediaConnect flow + one output costs roughly
+# $0.20/hour in eu-west-2 (≈ $144/mo if left running 24×7). Use the
+# `scripts/aws-relay.sh start|stop` helpers to only run it during flights.
+
+locals {
+  flow_name         = "bumps-video-drone"
+  source_name       = "drone-srt-in"
+  output_name       = "home-srt-out"
+  srt_input_port    = 9999
+  srt_output_port   = 9998
+  srt_latency_ms    = 2500
+  srt_max_bitrate   = 8000000 # bits/s — matches the ?maxbw= in the URI
+  availability_zone = "eu-west-2a"
+}
+
+resource "awscc_mediaconnect_flow" "drone" {
+  name              = local.flow_name
+  availability_zone = local.availability_zone
+
+  source = {
+    name           = local.source_name
+    description    = "Incoming SRT from bumps-pipe via Starlink"
+    protocol       = "srt-listener"
+    ingest_port    = local.srt_input_port
+    whitelist_cidr = "0.0.0.0/0" # SRT is authenticated by passphrase if set; rotation/IP-pinning isn't practical with Starlink
+    min_latency    = local.srt_latency_ms
+    max_latency    = local.srt_latency_ms * 2
+    max_bitrate    = local.srt_max_bitrate
+  }
+}
+
+resource "awscc_mediaconnect_flow_output" "home" {
+  flow_arn        = awscc_mediaconnect_flow.drone.flow_arn
+  name            = local.output_name
+  description     = "Outgoing SRT to home PC / OBS"
+  protocol        = "srt-listener"
+  port            = local.srt_output_port
+  max_latency     = local.srt_latency_ms
+  cidr_allow_list = ["0.0.0.0/0"] # restrict to your home /32 if you want and have a fixed IP
+}

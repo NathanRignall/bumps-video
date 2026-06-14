@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>bumps-pipe preview</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: #0d0f12;
+    color: #d6d8db;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 8px 14px;
+    background: #1a1d22;
+    border-bottom: 1px solid #2a2e35;
+    display: flex; align-items: center; gap: 16px;
+  }
+  header h1 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: 0.02em; }
+  .pill {
+    padding: 2px 10px; border-radius: 10px;
+    background: #2a2e35;
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: 11px;
+    font-weight: 600;
+  }
+  .pill.ok   { background: #1f4131; color: #7be0a4; }
+  .pill.warn { background: #4a3a14; color: #f6c177; }
+  .pill.bad  { background: #4a1a1a; color: #f08080; }
+  #info { font-family: ui-monospace, SFMono-Regular, monospace; opacity: 0.65; font-size: 11px; }
+
+  main { flex: 1; display: grid; grid-template-columns: 1fr 280px; min-height: 0; }
+  #preview { display: grid; place-items: center; padding: 16px; min-width: 0; min-height: 0; background: #0a0c0e; }
+  canvas#v {
+    max-width: 100%; max-height: 100%;
+    background: #000;
+    border-radius: 4px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+  }
+
+  #side {
+    border-left: 1px solid #2a2e35;
+    background: #14171c;
+    overflow-y: auto;
+    padding: 10px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .card {
+    background: #1a1d22;
+    border: 1px solid #2a2e35;
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
+  .card h2 {
+    margin: 0 0 6px 0; font-size: 10px; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase; opacity: 0.55;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .card h2 .badge {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 10px; padding: 1px 6px; border-radius: 8px;
+    background: #2a2e35; color: #d6d8db; text-transform: none; letter-spacing: 0;
+  }
+  .card h2 .badge.ok   { background: #1f4131; color: #7be0a4; }
+  .card h2 .badge.warn { background: #4a3a14; color: #f6c177; }
+  .card h2 .badge.bad  { background: #4a1a1a; color: #f08080; }
+  dl.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 11px; }
+  dl.kv dt { opacity: 0.55; }
+  dl.kv dd { margin: 0; text-align: right; }
+  canvas.spark { display: block; margin-top: 6px; width: 100%; height: 28px; }
+
+  /* Operator strip lives in the header so the sidebar stays focused on
+     pipeline state. Compact and right-aligned via margin-left:auto. */
+  .ops {
+    margin-left: auto;
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+  .ops input[type="number"] {
+    width: 64px;
+    background: #0d0f12; color: #d6d8db;
+    border: 1px solid #2a2e35; border-radius: 3px;
+    padding: 2px 6px;
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: 10px;
+    text-align: right;
+    -moz-appearance: textfield;
+  }
+  .ops input[type="number"]::-webkit-inner-spin-button,
+  .ops input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; }
+  .op-btn {
+    background: #2a2e35; color: #d6d8db;
+    border: 1px solid #3a3e45; border-radius: 3px;
+    padding: 2px 8px;
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: 10px;
+    cursor: pointer;
+    line-height: 1.4;
+  }
+  .op-btn:hover { background: #3a3e45; }
+  .op-btn:active { background: #4a4e55; }
+  .op-btn.op-bad { color: #f08080; border-color: #4a1a1a; }
+  .op-btn.op-bad:hover { background: #4a1a1a; }
+</style>
+</head>
+<body>
+<header>
+  <h1>bumps-pipe</h1>
+  <span id="status" class="pill warn">connecting…</span>
+  <span id="info"></span>
+  <div class="ops">
+    <button class="op-btn" id="btn-keyframe" title="Force the encoder to emit an IDR keyframe now">key</button>
+    <input type="number" id="bitrate-input" min="500" max="20000" step="250" placeholder="kbps" title="Bitrate to pin the encoder to" />
+    <button class="op-btn" id="btn-pin" title="Pin encoder bitrate; disables adaptation">pin</button>
+    <button class="op-btn" id="btn-unpin" title="Release bitrate pin; resume adaptation">unpin</button>
+    <button class="op-btn op-bad" id="btn-restart" title="Tear down + rebuild the pipeline now">restart</button>
+  </div>
+</header>
+<main>
+  <section id="preview">
+    <canvas id="v" width="1280" height="720"></canvas>
+  </section>
+
+  <aside id="side">
+    <div class="card" id="card-downlink">
+      <h2>Downlink <span class="badge" id="d-state">idle</span></h2>
+      <dl class="kv">
+        <dt>bitrate</dt>   <dd><span id="d-bitrate">–</span> kbps</dd>
+        <dt>frames in</dt> <dd id="d-frames">–</dd>
+        <dt>bytes in</dt>  <dd id="d-bytes">–</dd>
+        <dt>last frame</dt><dd id="d-age">–</dd>
+        <dt>session up</dt><dd id="d-uptime">–</dd>
+      </dl>
+      <canvas class="spark" id="sp-down" width="200" height="28"></canvas>
+    </div>
+
+    <div class="card" id="card-encoder">
+      <h2>Encoder <span class="badge" id="e-codec">–</span></h2>
+      <dl class="kv">
+        <dt title="Live target the adapter has chosen. With adapt off this equals nominal.">target</dt>
+                          <dd><span id="e-target">–</span> <span id="e-delta" style="opacity:.55"></span> kbps</dd>
+        <dt title="The --bitrate-kbps the user configured.">nominal</dt>
+                          <dd><span id="e-nominal">–</span> kbps</dd>
+        <dt>actual</dt>   <dd><span id="e-actual">–</span> kbps</dd>
+        <dt title="Quality 0.0–1.0. Maps per-encoder to target-usage / speed-preset / quality.">quality</dt>
+                          <dd id="e-quality">–</dd>
+        <dt>adapt</dt>    <dd id="e-adapt">–</dd>
+        <dt>frames</dt>   <dd id="e-frames">–</dd>
+      </dl>
+      <canvas class="spark" id="sp-enc" width="200" height="28"></canvas>
+    </div>
+
+    <div class="card" id="card-uplink">
+      <h2>Uplink (SRT) <span class="badge" id="u-state">idle</span></h2>
+      <dl class="kv">
+        <dt>rtt</dt>      <dd><span id="u-rtt">–</span> ms</dd>
+        <dt>send rate</dt><dd><span id="u-send">–</span> kbps</dd>
+        <dt title="SRT's path-capacity estimate. On loopback it saturates; on Starlink it'll be the real headroom.">link cap</dt>
+                          <dd><span id="u-bw">–</span> Mbps</dd>
+        <dt>sent</dt>     <dd id="u-bytes">–</dd>
+        <dt>retrans</dt>  <dd id="u-retx">–</dd>
+        <dt>loss</dt>     <dd><span id="u-loss">–</span> %</dd>
+      </dl>
+      <canvas class="spark" id="sp-rtt" width="200" height="28"></canvas>
+    </div>
+
+    <div class="card" id="card-ping">
+      <h2>AWS Ping <span class="badge" id="g-state">–</span></h2>
+      <dl class="kv">
+        <dt>target</dt>  <dd id="g-target">–</dd>
+        <dt>rtt</dt>     <dd><span id="g-rtt">–</span> ms</dd>
+        <dt>ewma</dt>    <dd><span id="g-ewma">–</span> ms</dd>
+        <dt>ok / fail</dt><dd id="g-ok">–</dd>
+        <dt>last ok</dt> <dd id="g-age">–</dd>
+      </dl>
+      <canvas class="spark" id="sp-ping" width="200" height="28"></canvas>
+    </div>
+
+    <div class="card" id="card-preview-stats">
+      <h2>Preview</h2>
+      <dl class="kv">
+        <dt>clients</dt> <dd id="p-clients">–</dd>
+        <dt>frames</dt>  <dd id="p-frames">–</dd>
+        <dt>bytes</dt>   <dd id="p-bytes">–</dd>
+        <dt>dropped</dt> <dd id="p-dropped">–</dd>
+      </dl>
+    </div>
+
+  </aside>
+</main>
+
+<script>
+'use strict';
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status');
+const infoEl   = $('info');
+const canvas   = $('v');
+const ctx      = canvas.getContext('2d');
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = 'pill ' + (cls || 'warn');
+}
+
+// ── Video decode + render ───────────────────────────────────────────────
+let decoder = null;
+let lastFrame = null;
+let framesIn = 0, framesDecoded = 0, framesShown = 0;
+let lastReport = performance.now();
+
+function teardownDecoder() {
+  if (decoder) {
+    try { decoder.close(); } catch (_) {}
+    decoder = null;
+  }
+  if (lastFrame) {
+    try { lastFrame.close(); } catch (_) {}
+    lastFrame = null;
+  }
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+function configureDecoder(init) {
+  teardownDecoder();
+  canvas.width = init.width;
+  canvas.height = init.height;
+  decoder = new VideoDecoder({
+    output: frame => {
+      framesDecoded++;
+      if (lastFrame) { try { lastFrame.close(); } catch (_) {} }
+      lastFrame = frame;
+    },
+    error: err => { console.error('VideoDecoder error', err); }
+  });
+  try {
+    decoder.configure({ codec: init.codec, optimizeForLatency: true });
+    const fps = init.fps_den ? (init.fps_num / init.fps_den).toFixed(2) : '?';
+    infoEl.textContent = `${init.codec} · ${init.width}×${init.height} @ ${fps}fps`;
+  } catch (e) {
+    console.error('configure failed', e);
+    setStatus('codec unsupported', 'bad');
+  }
+}
+
+function handleBinary(buf) {
+  framesIn++;
+  if (!decoder || decoder.state !== 'configured') return;
+  if (buf.length < 9) return;
+  const flags = buf[0];
+  const isKey = (flags & 0x01) !== 0;
+  const dv = new DataView(buf.buffer, buf.byteOffset + 1, 8);
+  const ptsUs = Number(dv.getBigUint64(0, true));
+  const payload = buf.subarray(9);
+  try {
+    decoder.decode(new EncodedVideoChunk({
+      type: isKey ? 'key' : 'delta',
+      timestamp: ptsUs,
+      data: payload,
+    }));
+  } catch (e) {
+    console.error('decode failed', e);
+  }
+}
+
+// ── Stats rendering ─────────────────────────────────────────────────────
+const N = 60;
+const series = {
+  down: new Array(N).fill(0),
+  enc:  new Array(N).fill(0),
+  rtt:  new Array(N).fill(0),
+  ping: new Array(N).fill(0),
+};
+
+function pushSeries(name, v) {
+  series[name].push(v);
+  series[name].shift();
+}
+
+function drawSpark(canvas, data, color) {
+  const c = canvas.getContext('2d');
+  const w = canvas.width = canvas.clientWidth * devicePixelRatio;
+  const h = canvas.height = canvas.clientHeight * devicePixelRatio;
+  c.clearRect(0, 0, w, h);
+  const max = Math.max(1, ...data);
+  c.strokeStyle = color;
+  c.lineWidth = 1.5 * devicePixelRatio;
+  c.beginPath();
+  for (let i = 0; i < data.length; i++) {
+    const x = (i / (data.length - 1)) * w;
+    const y = h - (data[i] / max) * h;
+    if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
+  }
+  c.stroke();
+}
+
+function fmtBytes(n) {
+  if (!n) return '0';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let i = 0; let v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2) + ' ' + units[i];
+}
+
+function fmtSecs(s) {
+  if (s == null) return '–';
+  if (s < 60) return s.toFixed(1) + 's';
+  const m = Math.floor(s / 60); const rs = Math.floor(s % 60);
+  return `${m}m${rs.toString().padStart(2,'0')}s`;
+}
+
+function badge(el, cls, text) {
+  el.className = 'badge ' + cls;
+  el.textContent = text;
+}
+
+function applyStats(s) {
+  // Header rollup
+  setStatus(s.pipeline.rollup, s.pipeline.rollup);
+
+  // Downlink
+  badge($('d-state'), s.downlink.connected ? 'ok' : 'warn',
+        s.downlink.connected ? 'live' : 'idle');
+  $('d-bitrate').textContent = s.downlink.bitrate_kbps.toFixed(0);
+  $('d-frames').textContent  = s.downlink.frames_in.toLocaleString();
+  $('d-bytes').textContent   = fmtBytes(s.downlink.bytes_in);
+  $('d-age').textContent     = s.downlink.last_frame_age_ms == null
+    ? '–'
+    : s.downlink.last_frame_age_ms + ' ms';
+  $('d-uptime').textContent  = fmtSecs(s.downlink.session_uptime_s);
+  pushSeries('down', s.downlink.bitrate_kbps);
+  drawSpark($('sp-down'), series.down, '#7be0a4');
+
+  // Encoder
+  badge($('e-codec'), 'ok', s.encoder.codec);
+  $('e-target').textContent  = s.encoder.target_kbps;
+  $('e-nominal').textContent = s.encoder.nominal_kbps;
+  $('e-actual').textContent  = s.encoder.actual_kbps.toFixed(0);
+  $('e-frames').textContent  = s.encoder.frames_out.toLocaleString();
+  $('e-quality').textContent = s.encoder.quality.toFixed(2);
+
+  // Delta from nominal, e.g. " (−25%)" when adapter has dropped us
+  if (s.encoder.override_kbps > 0) {
+    $('e-delta').textContent = '(pinned)';
+  } else if (s.encoder.nominal_kbps > 0 && s.encoder.target_kbps !== s.encoder.nominal_kbps) {
+    const pct = Math.round(100 * (s.encoder.target_kbps - s.encoder.nominal_kbps) / s.encoder.nominal_kbps);
+    $('e-delta').textContent = `(${pct > 0 ? '+' : ''}${pct}%)`;
+  } else {
+    $('e-delta').textContent = '';
+  }
+
+  if (s.encoder.override_kbps > 0) {
+    $('e-adapt').textContent =
+      `pinned at ${s.encoder.override_kbps} kbps`;
+  } else if (s.encoder.adapt_enabled) {
+    $('e-adapt').textContent =
+      `on  ↑${s.encoder.step_ups} ↓${s.encoder.step_downs}  ` +
+      `[${s.encoder.min_kbps}–${s.encoder.max_kbps}]`;
+  } else {
+    $('e-adapt').textContent = 'off';
+  }
+
+  pushSeries('enc', s.encoder.actual_kbps);
+  drawSpark($('sp-enc'), series.enc, '#7bbbff');
+
+  // Uplink
+  const uCls = s.uplink.state === 'connected' ? 'ok'
+             : s.uplink.state === 'connecting' ? 'warn'
+             : s.uplink.state === 'lost' ? 'bad' : 'warn';
+  badge($('u-state'), uCls, s.uplink.state);
+  $('u-rtt').textContent   = s.uplink.rtt_ms.toFixed(1);
+  $('u-send').textContent  = s.uplink.send_kbps.toFixed(0);
+  $('u-bw').textContent    = s.uplink.link_cap_mbps.toFixed(2);
+  $('u-bytes').textContent = fmtBytes(s.uplink.sent_bytes);
+  $('u-retx').textContent  = s.uplink.retransmitted_pkts.toLocaleString();
+  $('u-loss').textContent  = (s.uplink.pkt_loss_rate * 100).toFixed(2);
+  pushSeries('rtt', s.uplink.rtt_ms);
+  drawSpark($('sp-rtt'), series.rtt, '#f6c177');
+
+  // AWS ping
+  const g = s.ping;
+  const gOk = g.last_success_age_s != null && g.last_success_age_s < 10;
+  const gWarn = !gOk && g.last_success_age_s != null && g.last_success_age_s < 60;
+  badge($('g-state'),
+        gOk ? 'ok' : gWarn ? 'warn' : 'bad',
+        g.last_rtt_ms == null ? 'no data'
+          : gOk ? 'reachable'
+          : 'stale');
+  $('g-target').textContent = g.target;
+  $('g-rtt').textContent    = g.last_rtt_ms == null ? '–' : g.last_rtt_ms.toFixed(1);
+  $('g-ewma').textContent   = g.ewma_rtt_ms.toFixed(1);
+  $('g-ok').textContent     = `${g.success_count.toLocaleString()} / ${g.failure_count.toLocaleString()}`;
+  $('g-age').textContent    = fmtSecs(g.last_success_age_s);
+  pushSeries('ping', g.last_rtt_ms ?? 0);
+  drawSpark($('sp-ping'), series.ping, '#a988ff');
+
+  // Preview
+  $('p-clients').textContent = s.preview.clients;
+  $('p-frames').textContent  = s.preview.sent_frames.toLocaleString();
+  $('p-bytes').textContent   = fmtBytes(s.preview.sent_bytes);
+  $('p-dropped').textContent = s.preview.dropped.toLocaleString();
+}
+
+function handleJson(text) {
+  let msg;
+  try { msg = JSON.parse(text); } catch (e) { console.error('bad json', e); return; }
+  if (msg.kind === 'init') {
+    configureDecoder(msg);
+  } else if (msg.kind === 'stats') {
+    applyStats(msg);
+  } else if (msg.kind === 'event') {
+    // Phase-3+ event banner could land here.
+  }
+}
+
+// ── Render loop ─────────────────────────────────────────────────────────
+function tick() {
+  if (lastFrame) {
+    ctx.drawImage(lastFrame, 0, 0, canvas.width, canvas.height);
+    framesShown++;
+  }
+  const now = performance.now();
+  if (now - lastReport > 1000) {
+    const dt = (now - lastReport) / 1000;
+    if (decoder && decoder.state === 'configured') {
+      const fpsIn  = (framesIn  / dt).toFixed(1);
+      const fpsDec = (framesDecoded / dt).toFixed(1);
+      const fpsOut = (framesShown / dt).toFixed(1);
+      infoEl.textContent = `${canvas.width}×${canvas.height}  ·  in ${fpsIn}/s  dec ${fpsDec}/s  render ${fpsOut}/s`;
+    }
+    framesIn = framesDecoded = framesShown = 0;
+    lastReport = now;
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// ── WebSocket lifecycle ────────────────────────────────────────────────
+let activeWs = null;
+
+function send(cmd) {
+  if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+    activeWs.send(JSON.stringify(cmd));
+  }
+}
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen  = () => { activeWs = ws; setStatus('connected', 'warn'); };
+  ws.onclose = () => {
+    activeWs = null;
+    setStatus('disconnected — retrying…', 'bad');
+    teardownDecoder();
+    setTimeout(connect, 1500);
+  };
+  ws.onerror   = e => console.error('ws error', e);
+  ws.onmessage = ev => {
+    if (typeof ev.data === 'string') handleJson(ev.data);
+    else handleBinary(new Uint8Array(ev.data));
+  };
+}
+connect();
+
+// ── Operator buttons ──────────────────────────────────────────────────
+function flash(el) {
+  el.style.background = '#1f4131';
+  setTimeout(() => { el.style.background = ''; }, 250);
+}
+
+$('btn-keyframe').addEventListener('click', () => {
+  send({ kind: 'request_keyframe' });
+  flash($('btn-keyframe'));
+});
+
+$('btn-restart').addEventListener('click', () => {
+  if (!confirm('Restart the pipeline now? Brief preview gap while it rebuilds.')) return;
+  send({ kind: 'restart_pipeline' });
+  flash($('btn-restart'));
+});
+
+$('btn-pin').addEventListener('click', () => {
+  const v = parseInt($('bitrate-input').value, 10);
+  if (!Number.isFinite(v) || v < 100) {
+    alert('Enter a bitrate in kbps (≥ 100)');
+    return;
+  }
+  send({ kind: 'set_bitrate', kbps: v });
+  flash($('btn-pin'));
+});
+
+$('btn-unpin').addEventListener('click', () => {
+  send({ kind: 'clear_bitrate_override' });
+  flash($('btn-unpin'));
+});
+</script>
+</body>
+</html>

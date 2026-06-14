@@ -1,0 +1,9 @@
+.terraform/
+*.tfstate
+*.tfstate.backup
+.build/
+.direnv/
+captures/
+target/
+test-runs/
+.DS_Store
