@@ -56,9 +56,11 @@ resource "awscc_mediaconnect_flow" "drone" {
 resource "awscc_mediaconnect_flow_output" "home" {
   flow_arn = awscc_mediaconnect_flow.drone.flow_arn
   name     = local.output_name
-  # MediaConnect rejects descriptions containing some special characters
-  # (e.g. `/`). Keep this conservative: ASCII letters, digits, spaces, hyphens.
-  description     = "Outgoing SRT to home PC or OBS"
+  # `description` is intentionally omitted. MediaConnect rejects FlowOutput
+  # descriptions with an opaque "Invalid description." 400, even for plain
+  # ASCII strings that meet documented rules. The field is optional and
+  # cosmetic (console-only), so it's safer to skip it entirely. If we ever
+  # need it back, test in isolation first.
   protocol        = "srt-listener"
   port            = local.srt_output_port
   max_latency     = local.srt_latency_ms
