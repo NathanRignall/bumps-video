@@ -592,12 +592,13 @@ fn build_encoder(cfg: &Config) -> Result<EncoderBuilt> {
         }
         EncoderKind::VaHevc => {
             // VA-API HEVC via gst-plugins-bad's `va` plugin. Same Intel iGPU
-            // as QSV, accessed via libva. Property names differ slightly
-            // from QSV: `key-int-max` (frames) instead of `gop-size`.
+            // as QSV, accessed via libva. The `va` plugin's rate-control
+            // model is different from QSV: there's no `max-bitrate`
+            // property; instead the `bitrate` value is the cap and
+            // `target-percentage` (if present) controls the average.
             let encoder = gstreamer::ElementFactory::make("vah265enc")
                 .name("enc")
-                .property("bitrate", cfg.bitrate_kbps)
-                .property("max-bitrate", cfg.max_bitrate_kbps)
+                .property("bitrate", cfg.max_bitrate_kbps)
                 .property("key-int-max", cfg.gop_size)
                 .property("target-usage", qsv_target_usage(q))
                 .property_from_str("rate-control", "vbr")
@@ -615,8 +616,7 @@ fn build_encoder(cfg: &Config) -> Result<EncoderBuilt> {
             let target_usage = qsv_target_usage(q).max(3);
             let encoder = gstreamer::ElementFactory::make("vaav1enc")
                 .name("enc")
-                .property("bitrate", cfg.bitrate_kbps)
-                .property("max-bitrate", cfg.max_bitrate_kbps)
+                .property("bitrate", cfg.max_bitrate_kbps)
                 .property("key-int-max", cfg.gop_size)
                 .property("target-usage", target_usage)
                 .property_from_str("rate-control", "vbr")
