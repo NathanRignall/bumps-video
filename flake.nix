@@ -37,6 +37,9 @@
             pkgs.clippy
             pkgs.rustfmt
             pkgs.pkg-config
+            # For scripts/aws-relay.sh (status/start/stop/urls)
+            pkgs.awscli2
+            pkgs.jq
           ];
           shellHook = ''
             export LIBVA_DRIVER_NAME=iHD

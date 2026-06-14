@@ -178,8 +178,24 @@ fn is_bad(s: &Snapshot) -> bool {
     s.uplink.pkt_loss_rate > 0.01 || s.uplink.send_buf_pct > 0.7
 }
 
+/// "Good" requires not just a healthy link but also that the encoder is
+/// actually *using* the current target. Without this gate, the adapter
+/// happily inflates `target_kbps` even when the encoder is sitting at 5% of
+/// target because the content compresses well — pointless headroom, and a
+/// misleading dashboard number. 85% utilisation is the threshold above
+/// which more headroom would actually help.
+const UTIL_THRESHOLD: f32 = 0.85;
+
 fn is_good(s: &Snapshot) -> bool {
-    s.uplink.pkt_loss_rate < 0.001 && s.uplink.send_buf_pct < 0.3
+    let link_clean =
+        s.uplink.pkt_loss_rate < 0.001 && s.uplink.send_buf_pct < 0.3;
+    let utilising = if s.encoder.target_kbps == 0 {
+        // No target set yet — treat as "we don't know", so allow step-up.
+        true
+    } else {
+        s.encoder.actual_kbps / (s.encoder.target_kbps as f32) > UTIL_THRESHOLD
+    };
+    link_clean && utilising
 }
 
 /// Apply a new bitrate to the live encoder. All three of our encoders

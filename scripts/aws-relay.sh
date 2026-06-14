@@ -46,7 +46,9 @@ describe() {
   arn="$(flow_arn)"
   if [[ -z "$arn" || "$arn" == "None" ]]; then
     echo "error: no MediaConnect flow named '$FLOW_NAME' in $REGION" >&2
-    echo "       run `tofu -chdir=terraform apply` first?" >&2
+    echo "  - has 'tofu apply' actually completed in CI?" >&2
+    echo "  - does your local AWS CLI have eu-west-2 mediaconnect:ListFlows perms?" >&2
+    echo "    (try: aws sts get-caller-identity)" >&2
     exit 1
   fi
   aws --region "$REGION" mediaconnect describe-flow --flow-arn "$arn"
