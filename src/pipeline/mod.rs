@@ -89,6 +89,14 @@ pub enum EncoderKind {
     /// newer Intel iGPUs. ~30 % better compression at the same quality as
     /// HEVC, at the cost of higher per-frame encode latency.
     QsvAv1,
+    /// VA-API HEVC (`vah265enc`) from gst-plugins-bad's `va` plugin. Same
+    /// Intel iGPU silicon as QSV, accessed via libva instead of oneVPL.
+    /// Use this when the gst-plugins-bad build doesn't include the QSV
+    /// plugin (common on NixOS / nixpkgs default builds).
+    VaHevc,
+    /// VA-API AV1 (`vaav1enc`). Hardware AV1 encode via libva. Core Ultra
+    /// or newer Intel iGPUs.
+    VaAv1,
 }
 
 impl Default for EncoderKind {
@@ -108,6 +116,8 @@ impl std::fmt::Display for EncoderKind {
             Self::VtHevc => f.write_str("vt-hevc"),
             Self::X264 => f.write_str("x264"),
             Self::QsvAv1 => f.write_str("qsv-av1"),
+            Self::VaHevc => f.write_str("va-hevc"),
+            Self::VaAv1 => f.write_str("va-av1"),
         }
     }
 }

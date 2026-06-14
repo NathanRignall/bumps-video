@@ -287,9 +287,9 @@ fn install_preview_callbacks(
 
     let init_sent = Arc::new(AtomicBool::new(false));
     let kind = match encoder {
-        EncoderKind::QsvHevc | EncoderKind::VtHevc => MediaKind::Hevc,
+        EncoderKind::QsvHevc | EncoderKind::VtHevc | EncoderKind::VaHevc => MediaKind::Hevc,
         EncoderKind::X264 => MediaKind::H264,
-        EncoderKind::QsvAv1 => MediaKind::Av1,
+        EncoderKind::QsvAv1 | EncoderKind::VaAv1 => MediaKind::Av1,
     };
 
     appsink.set_callbacks(
@@ -586,6 +586,45 @@ fn build_encoder(cfg: &Config) -> Result<EncoderBuilt> {
                     "qsvav1enc factory — needs an Intel iGPU with hardware AV1 \
                      encode (Core Ultra / Arc-class). Older iGPUs will not show \
                      this element in `gst-inspect-1.0`.",
+                )?;
+            let parser = av1_parser()?;
+            Ok(EncoderBuilt { encoder, parser })
+        }
+        EncoderKind::VaHevc => {
+            // VA-API HEVC via gst-plugins-bad's `va` plugin. Same Intel iGPU
+            // as QSV, accessed via libva. Property names differ slightly
+            // from QSV: `key-int-max` (frames) instead of `gop-size`.
+            let encoder = gstreamer::ElementFactory::make("vah265enc")
+                .name("enc")
+                .property("bitrate", cfg.bitrate_kbps)
+                .property("max-bitrate", cfg.max_bitrate_kbps)
+                .property("key-int-max", cfg.gop_size)
+                .property("target-usage", qsv_target_usage(q))
+                .property_from_str("rate-control", "vbr")
+                .build()
+                .context(
+                    "vah265enc factory — provided by gst-plugins-bad's `va` \
+                     plugin. Confirm with `gst-inspect-1.0 vah265enc`.",
+                )?;
+            let parser = h265_parser()?;
+            Ok(EncoderBuilt { encoder, parser })
+        }
+        EncoderKind::VaAv1 => {
+            // VA-API AV1. Same caveat about AV1 encode being heavier than
+            // HEVC; mirror the QSV clamp on target-usage.
+            let target_usage = qsv_target_usage(q).max(3);
+            let encoder = gstreamer::ElementFactory::make("vaav1enc")
+                .name("enc")
+                .property("bitrate", cfg.bitrate_kbps)
+                .property("max-bitrate", cfg.max_bitrate_kbps)
+                .property("key-int-max", cfg.gop_size)
+                .property("target-usage", target_usage)
+                .property_from_str("rate-control", "vbr")
+                .build()
+                .context(
+                    "vaav1enc factory — provided by gst-plugins-bad's `va` \
+                     plugin. Requires hardware AV1 encode on the iGPU \
+                     (Core Ultra / Arc-class).",
                 )?;
             let parser = av1_parser()?;
             Ok(EncoderBuilt { encoder, parser })
