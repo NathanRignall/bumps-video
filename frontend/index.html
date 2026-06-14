@@ -205,8 +205,26 @@ function setStatus(text, cls) {
 }
 
 // ── Video decode + render ───────────────────────────────────────────────
+//
+// Pacing strategy: present each VideoFrame at its PTS-derived wall-clock
+// time, not as-soon-as-decoded. The decoder may burst frames out faster
+// than realtime when the encoder/WebSocket/browser tab coalesce delivery;
+// playing them at PTS rate produces smooth motion regardless.
+//
+// `renderEpochPts` / `renderEpochWallclock` anchor the PTS clock to wall
+// clock; everything else is delta from there. We re-anchor if a frame
+// arrives much later than scheduled (network stall recovery, tab unhidden).
+
+const TARGET_BUFFER_MS = 150;   // delay after first frame before playback starts
+const MAX_QUEUE_DEPTH  = 30;    // cap to ~1s of buffer; drop oldest if exceeded
+const REANCHOR_DRIFT_MS = 500;  // re-anchor PTS↔wallclock if drift exceeds this
+
 let decoder = null;
 let lastFrame = null;
+const frameQueue = [];          // decoded frames awaiting their presentation time
+let renderEpochPts = null;      // VideoFrame.timestamp (μs) anchored to wallclock
+let renderEpochWallclock = null; // performance.now() ms
+
 let framesIn = 0, framesDecoded = 0, framesShown = 0;
 let lastReport = performance.now();
 
@@ -215,10 +233,14 @@ function teardownDecoder() {
     try { decoder.close(); } catch (_) {}
     decoder = null;
   }
+  for (const f of frameQueue) { try { f.close(); } catch (_) {} }
+  frameQueue.length = 0;
   if (lastFrame) {
     try { lastFrame.close(); } catch (_) {}
     lastFrame = null;
   }
+  renderEpochPts = null;
+  renderEpochWallclock = null;
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 }
@@ -230,8 +252,18 @@ function configureDecoder(init) {
   decoder = new VideoDecoder({
     output: frame => {
       framesDecoded++;
-      if (lastFrame) { try { lastFrame.close(); } catch (_) {} }
-      lastFrame = frame;
+      if (renderEpochPts === null) {
+        // First frame: anchor PTS↔wallclock with TARGET_BUFFER_MS lead.
+        renderEpochPts = frame.timestamp;
+        renderEpochWallclock = performance.now() + TARGET_BUFFER_MS;
+      }
+      frameQueue.push(frame);
+      // Cap queue depth — drop oldest non-rendered frames if upstream
+      // bursts faster than playback. Keeps latency bounded.
+      while (frameQueue.length > MAX_QUEUE_DEPTH) {
+        const oldest = frameQueue.shift();
+        try { oldest.close(); } catch (_) {}
+      }
     },
     error: err => { console.error('VideoDecoder error', err); }
   });
@@ -243,6 +275,11 @@ function configureDecoder(init) {
     console.error('configure failed', e);
     setStatus('codec unsupported', 'bad');
   }
+}
+
+/// Wall-clock time at which a frame with the given PTS should be presented.
+function presentationTime(framePtsUs) {
+  return renderEpochWallclock + (framePtsUs - renderEpochPts) / 1000.0;
 }
 
 function handleBinary(buf) {
@@ -416,19 +453,52 @@ function handleJson(text) {
 }
 
 // ── Render loop ─────────────────────────────────────────────────────────
+//
+// Pull every frame whose presentation time has arrived. Keep the LAST one
+// of that batch as `lastFrame`; everything earlier is stale and gets
+// closed. If a frame is wildly late (>500 ms past schedule), re-anchor to
+// "now + buffer" so we don't try to catch up by stalling — gracefully
+// restarts playback after a network freeze.
 function tick() {
+  const now = performance.now();
+
+  if (renderEpochPts !== null) {
+    let nextFrame = null;
+    while (frameQueue.length > 0) {
+      const head = frameQueue[0];
+      const target = presentationTime(head.timestamp);
+      if (target > now) break; // not yet — keep in queue
+      // It's time (or past time) to show this frame.
+      if (now - target > REANCHOR_DRIFT_MS) {
+        // Way past schedule: drift / stall happened. Re-anchor and present
+        // this frame as the new "now".
+        renderEpochPts = head.timestamp;
+        renderEpochWallclock = now;
+      }
+      frameQueue.shift();
+      if (nextFrame) { try { nextFrame.close(); } catch (_) {} }
+      nextFrame = head;
+    }
+    if (nextFrame) {
+      if (lastFrame) { try { lastFrame.close(); } catch (_) {} }
+      lastFrame = nextFrame;
+    }
+  }
+
   if (lastFrame) {
     ctx.drawImage(lastFrame, 0, 0, canvas.width, canvas.height);
     framesShown++;
   }
-  const now = performance.now();
+
   if (now - lastReport > 1000) {
     const dt = (now - lastReport) / 1000;
     if (decoder && decoder.state === 'configured') {
       const fpsIn  = (framesIn  / dt).toFixed(1);
       const fpsDec = (framesDecoded / dt).toFixed(1);
       const fpsOut = (framesShown / dt).toFixed(1);
-      infoEl.textContent = `${canvas.width}×${canvas.height}  ·  in ${fpsIn}/s  dec ${fpsDec}/s  render ${fpsOut}/s`;
+      const buf = frameQueue.length;
+      infoEl.textContent =
+        `${canvas.width}×${canvas.height}  ·  in ${fpsIn}/s  dec ${fpsDec}/s  render ${fpsOut}/s  buf ${buf}`;
     }
     framesIn = framesDecoded = framesShown = 0;
     lastReport = now;
