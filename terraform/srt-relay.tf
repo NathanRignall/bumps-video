@@ -45,9 +45,11 @@ resource "awscc_mediaconnect_flow" "drone" {
     protocol       = "srt-listener"
     ingest_port    = local.srt_input_port
     whitelist_cidr = "0.0.0.0/0" # SRT is authenticated by passphrase if set; rotation/IP-pinning isn't practical with Starlink
-    min_latency    = local.srt_latency_ms
-    max_latency    = local.srt_latency_ms * 2
-    max_bitrate    = local.srt_max_bitrate
+    # MediaConnect SRT-listener sources accept only MinLatency (the receive
+    # buffer). MaxLatency is rejected with a 400 — that field is for caller
+    # mode only. Outputs still take MaxLatency.
+    min_latency = local.srt_latency_ms
+    max_bitrate = local.srt_max_bitrate
   }
 }
 
