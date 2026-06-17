@@ -61,12 +61,15 @@ pub struct PreviewSinks {
 }
 
 /// Pipeline-level error surfaced by the bus watch.
+///
+/// srtsink errors are deliberately *not* surfaced here — that element
+/// auto-reconnects internally and tearing down the whole pipeline on each
+/// of its transient errors creates a connect/disconnect feedback loop with
+/// the receiver. See `spawn_bus_watch` for the handling path.
 #[derive(Debug, Clone)]
 pub enum PipelineError {
-    /// The srtsink element reported a failure.
-    SrtFailed(String),
-    /// Some other element errored — currently treated the same as SRT for
-    /// recovery purposes (full pipeline rebuild).
+    /// A non-srtsink element errored. The current pipeline instance is
+    /// rebuilt by the reconnect machinery in [`run`].
     Other { src: String, message: String },
 }
 
@@ -365,12 +368,9 @@ async fn handle_pipeline_error(
         return;
     }
 
-    let (kind, message) = match &err {
-        PipelineError::SrtFailed(m) => ("srt_lost", m.clone()),
-        PipelineError::Other { src, message } => {
-            ("pipeline_error", format!("{src}: {message}"))
-        }
-    };
+    let PipelineError::Other { src, message: msg } = &err;
+    let kind = "pipeline_error";
+    let message = format!("{src}: {msg}");
     tracing::warn!(%message, "pipeline: {kind}; tearing down and scheduling reconnect");
 
     if let Some(prev) = session.take() {
@@ -672,24 +672,44 @@ fn spawn_bus_watch(
                         debug = ?err.debug(),
                         "pipeline error"
                     );
-                    // Route to the reconnect machinery. We treat any error as
-                    // recoverable; the loop in pipeline::run will rebuild.
-                    let pe = if src_name == "uplink" {
-                        PipelineError::SrtFailed(err_msg.clone())
-                    } else {
-                        PipelineError::Other {
-                            src: src_name.clone(),
-                            message: err_msg.clone(),
-                        }
-                    };
-                    let _ = error_tx.try_send(pe);
                     let _ = capture_event_tx.try_send(CaptureEventReq {
                         kind: "pipeline_error".into(),
                         details: serde_json::json!({
                             "src": src_name,
-                            "error": err_msg,
+                            "error": err_msg.clone(),
                         }),
                     });
+
+                    if src_name == "uplink" {
+                        // srtsink is responsible for its own reconnection.
+                        // The element emits transient bus Errors when the
+                        // SRT session wobbles — tearing down + rebuilding
+                        // the whole pipeline in response creates a fresh
+                        // SRT handshake every time, which MediaConnect
+                        // registers as a brand-new "source connected"
+                        // event. The result is a connect/disconnect cycle
+                        // every few seconds with no actual recovery.
+                        //
+                        // Just mark the dashboard as Lost. The bus
+                        // Warning watchdog further down already clears
+                        // that state once srtsink stops complaining for
+                        // SRT_WARN_DECAY (3.5 s).
+                        use std::sync::atomic::Ordering;
+                        stats
+                            .srt_warning_at_us
+                            .store(stats.now_us(), Ordering::Relaxed);
+                        if stats.get_uplink_state() == UplinkState::Connected {
+                            stats.set_uplink_state(UplinkState::Lost);
+                        }
+                    } else {
+                        // Non-srtsink errors are unrecoverable for the
+                        // current pipeline instance; route to the
+                        // reconnect machinery for a clean rebuild.
+                        let _ = error_tx.try_send(PipelineError::Other {
+                            src: src_name.clone(),
+                            message: err_msg.clone(),
+                        });
+                    }
                 }
                 MessageView::Warning(w) => {
                     let src_name = w.src().map(|s| s.name().to_string()).unwrap_or_default();
