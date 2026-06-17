@@ -15,9 +15,12 @@
 #                               congestion; still watchable
 #       - ceiling 4000 kbps   → ~5 Mbps peak when the link is clean,
 #                               well below the Mini's worst-case uplink
-#   * Same x264 software encoder. Hardware vah265enc is faster but its
-#     CBR pacing on Intel iGPU was bursty enough to defeat SRT's
-#     smoothing; the x264 path was empirically clean against MediaConnect.
+#   * VA-API HEVC hardware encoder. Once the surrounding pipeline was
+#     fixed (timestamp flattener, videorate cadence smoother, srtsink
+#     sync=false, CBR with cpb-size pinned), vah265enc behaved cleanly
+#     — and it gives ~30 % better quality than x264 at the same bitrate
+#     at near-zero CPU cost. If it ever regresses in the field, fall
+#     back to `BUMPS_ENCODER=x264` for the software path.
 #
 # Override via environment:
 #   BUMPS_SRT_HOST=1.2.3.4 ./scripts/run-starlink.sh
@@ -44,7 +47,7 @@ cd "$(dirname "$0")/.."
 : "${BUMPS_BITRATE_KBPS:=3000}"
 : "${BUMPS_MIN_KBPS:=1500}"
 : "${BUMPS_MAX_KBPS:=4000}"
-: "${BUMPS_ENCODER:=x264}"
+: "${BUMPS_ENCODER:=va-hevc}"
 
 echo "== bumps-pipe Starlink launcher =="
 echo "  encoder    : ${BUMPS_ENCODER}"
