@@ -17,6 +17,7 @@
 #   BITRATE=4000 ./scripts/ffmpeg-test.sh             # lower bitrate
 #   SRT_HOST=1.2.3.4 ./scripts/ffmpeg-test.sh         # different relay
 #   SRC=rtmp ./scripts/ffmpeg-test.sh                 # listen on RTMP
+#   SRC=rtmp CODEC=copy ./scripts/ffmpeg-test.sh      # passthrough (no encode)
 #
 # Viewer URL (paste into ffplay / VLC / OBS):
 #   srt://<host>:9998?mode=caller&latency=8000&peerlatency=8000&rcvbuf=25000000
@@ -25,8 +26,9 @@ set -euo pipefail
 
 : "${SRT_HOST:=3.11.124.82}"
 : "${SRT_PORT:=9999}"
-: "${BITRATE:=8000}"   # kbps
+: "${BITRATE:=8000}"   # kbps; ignored when CODEC=copy
 : "${SRC:=bars}"       # "bars" | "rtmp"
+: "${CODEC:=hevc}"     # "hevc" (re-encode) | "copy" (stream-copy, RTMP only)
 
 case "$SRC" in
   bars)
@@ -75,29 +77,54 @@ cat <<EOF
 
 EOF
 
-# Why each x265 / ffmpeg flag:
-#   -preset ultrafast / -tune zerolatency  : real-time encode on CPU,
-#                                            no B-frames, no lookahead.
-#   -b:v / -maxrate / -bufsize all equal   : CBR with a 1s HRD buffer.
-#   keyint = min-keyint = 30, scenecut=0   : fixed 1 s GOP, no surprise IDRs.
-#   repeat-headers=1                       : VPS/SPS/PPS at every IDR so the
-#                                            receiver can resync from any IDR.
-#   -pix_fmt yuv420p                       : universally decodable HEVC.
-#   -an                                    : no audio (matches bumps-pipe).
-#   -f mpegts                              : MPEG-TS container; SRT carries TS.
+case "$CODEC" in
+  hevc)
+    # Why each x265 / ffmpeg flag:
+    #   -preset ultrafast / -tune zerolatency  : real-time encode on CPU,
+    #                                            no B-frames, no lookahead.
+    #   -b:v / -maxrate / -bufsize all equal   : CBR with a 1s HRD buffer.
+    #   keyint = min-keyint = 30, scenecut=0   : fixed 1 s GOP, no surprise IDRs.
+    #   repeat-headers=1                       : VPS/SPS/PPS at every IDR so the
+    #                                            receiver can resync from any IDR.
+    #   -pix_fmt yuv420p                       : universally decodable HEVC.
+    #   -an                                    : no audio (matches bumps-pipe).
+    #   -f mpegts                              : MPEG-TS container; SRT carries TS.
+    CODEC_ARGS=(
+      -c:v libx265
+      -preset ultrafast
+      -tune zerolatency
+      -b:v "${BITRATE}k"
+      -maxrate "${BITRATE}k"
+      -bufsize "${BITRATE}k"
+      -pix_fmt yuv420p
+      -x265-params "keyint=30:min-keyint=30:scenecut=0:repeat-headers=1:bframes=0"
+    )
+    ;;
+  copy)
+    # Stream-copy mode: take the publisher's H.264 NAL units as-is and
+    # repackage into MPEG-TS for SRT. No decoder, no encoder, no PTS
+    # rewriting beyond what FLV→MPEG-TS muxing requires. Use this when
+    # the publisher's H.264 stream is too pathological to decode cleanly
+    # (DJI Fly emits NAL framing that ffmpeg's strict parser rejects but
+    # gstreamer's avdec_h264 accepts). The receiver gets H.264, not HEVC.
+    #
+    # If even *this* doesn't push cleanly, the drone's bitstream itself
+    # is what's making bumps-pipe stutter at the AWS receiver, and we
+    # need a timestamp flattener before the encoder rather than after.
+    CODEC_ARGS=(-c:v copy)
+    ;;
+  *)
+    echo "error: CODEC must be 'hevc' or 'copy' (got '$CODEC')" >&2
+    exit 1
+    ;;
+esac
+
 exec ffmpeg \
   -hide_banner \
   -loglevel info \
   "${SRC_ARGS[@]}" \
   -map 0:v:0 \
-  -c:v libx265 \
-  -preset ultrafast \
-  -tune zerolatency \
-  -b:v ${BITRATE}k \
-  -maxrate ${BITRATE}k \
-  -bufsize ${BITRATE}k \
-  -pix_fmt yuv420p \
-  -x265-params "keyint=30:min-keyint=30:scenecut=0:repeat-headers=1:bframes=0" \
+  "${CODEC_ARGS[@]}" \
   -an \
   -f mpegts \
   "${SRT_URI}"
