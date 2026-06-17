@@ -39,6 +39,13 @@ pub async fn run(state: Arc<StatsState>, cfg: CollectorConfig, tx: watch::Sender
     let mut srt_send_kbps_ewma = 0.0_f32;
     let mut ping_rtt_ms_ewma = 0.0_f32;
     let mut prev_srt_sent_bytes: u64 = 0;
+    // Previous-sample SRT packet counters. The adapter needs an
+    // instantaneous loss rate (delta-based) rather than the lifetime
+    // cumulative ratio — the latter dilutes recent loss to invisibility
+    // over a long-running session, which is exactly what was preventing
+    // the adapter from ever stepping down.
+    let mut prev_srt_lost_pkts: u64 = 0;
+    let mut prev_srt_sent_pkts: u64 = 0;
 
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -93,7 +100,25 @@ pub async fn run(state: Arc<StatsState>, cfg: CollectorConfig, tx: watch::Sender
         let uplink_state_atomic = state.get_uplink_state();
         let uplink = if let Some(s) = raw_srt {
             srt_rtt_ms_ewma = ewma(srt_rtt_ms_ewma, s.rtt_ms, ALPHA);
-            srt_loss_ewma = ewma(srt_loss_ewma, s.pkt_loss_rate, ALPHA);
+
+            // Instantaneous loss rate over the 1-s sample window.
+            // libsrt's `packets-sent` and `packets-sent-lost` are
+            // cumulative, so we have to diff against the previous
+            // sample. Using the lifetime ratio (lost/sent) silently
+            // hid Starlink handover losses from the adapter — a 2-s
+            // 30 % loss burst added 0.0001 % to the lifetime average
+            // and never came near the 1 % step-down threshold.
+            let lost_delta = s.lost_pkts.saturating_sub(prev_srt_lost_pkts);
+            let sent_delta = s.sent_pkts.saturating_sub(prev_srt_sent_pkts);
+            let pkt_loss_rate_inst = if sent_delta == 0 {
+                0.0
+            } else {
+                lost_delta as f32 / sent_delta as f32
+            };
+            srt_loss_ewma = ewma(srt_loss_ewma, pkt_loss_rate_inst, ALPHA);
+            prev_srt_lost_pkts = s.lost_pkts;
+            prev_srt_sent_pkts = s.sent_pkts;
+
             let send_byte_delta = s.sent_bytes.saturating_sub(prev_srt_sent_bytes);
             let send_inst_kbps = bits_per_kbps(send_byte_delta, dt_s);
             srt_send_kbps_ewma = ewma(srt_send_kbps_ewma, send_inst_kbps, ALPHA);
@@ -111,6 +136,8 @@ pub async fn run(state: Arc<StatsState>, cfg: CollectorConfig, tx: watch::Sender
             }
         } else {
             prev_srt_sent_bytes = 0;
+            prev_srt_lost_pkts = 0;
+            prev_srt_sent_pkts = 0;
             srt_send_kbps_ewma = 0.0;
             UplinkStats {
                 state: uplink_state_atomic,
@@ -267,11 +294,16 @@ fn compute_rollup(
 struct RawSrtStats {
     rtt_ms: f32,
     bandwidth_mbps: f32,
+    /// Send buffer fullness as a fraction 0.0–1.0 of the configured SRT
+    /// latency window. When this climbs above ~0.7 the link is genuinely
+    /// congested — packets are arriving at srtsink faster than the network
+    /// is acknowledging them, and either retransmits or `tlpktdrop` are
+    /// imminent. The adapter steps the encoder down when this fires.
     send_buf_pct: f32,
     sent_bytes: u64,
     retransmitted_pkts: u64,
     lost_pkts: u64,
-    pkt_loss_rate: f32,
+    sent_pkts: u64,
 }
 
 fn poll_srt_stats(state: &StatsState) -> Option<RawSrtStats> {
@@ -292,19 +324,30 @@ fn poll_srt_stats(state: &StatsState) -> Option<RawSrtStats> {
     let retransmitted_pkts = s.get::<u64>("packets-retransmitted").unwrap_or(0);
     let lost_pkts = s.get::<u64>("packets-sent-lost").unwrap_or(0);
     let sent_pkts = s.get::<u64>("packets-sent").unwrap_or(0);
-    let pkt_loss_rate = if sent_pkts == 0 {
-        0.0
-    } else {
-        lost_pkts as f32 / sent_pkts as f32
+
+    // Send buffer fullness as a fraction of the negotiated SRT latency.
+    // Newer srtsink exposes `send-buffer-level-time` (microseconds) and
+    // `negotiated-latency` (milliseconds). Older versions don't, in which
+    // case we leave the fraction at 0.0 and the adapter only reacts to
+    // packet loss.
+    let send_buf_pct = match (
+        s.get::<u64>("send-buffer-level-time").ok(),
+        s.get::<i32>("negotiated-latency").ok(),
+    ) {
+        (Some(buf_us), Some(latency_ms)) if latency_ms > 0 => {
+            let latency_us = latency_ms as u64 * 1000;
+            (buf_us as f32 / latency_us as f32).clamp(0.0, 1.0)
+        }
+        _ => 0.0,
     };
 
     Some(RawSrtStats {
         rtt_ms,
         bandwidth_mbps,
-        send_buf_pct: 0.0, // not exposed as a normalised value; left for later
+        send_buf_pct,
         sent_bytes,
         retransmitted_pkts,
         lost_pkts,
-        pkt_loss_rate,
+        sent_pkts,
     })
 }

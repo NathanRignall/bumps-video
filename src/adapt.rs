@@ -25,7 +25,12 @@ use crate::capture::CaptureEventReq;
 use crate::stats::{Snapshot, StatsState};
 
 const COOLDOWN: Duration = Duration::from_secs(10);
-const BAD_TICKS_TO_STEP_DOWN: u32 = 5; // ~5 s of sustained bad stats
+// 3 s of sustained bad stats is enough to step down. Starlink handovers
+// can last 1-2 s; we want to catch a *handover plus aftermath* but not
+// react to every single sub-second loss spike. Was 5 s but that turned
+// out to be too long — combined with the previously-broken cumulative
+// loss-rate calculation, the adapter literally never stepped down.
+const BAD_TICKS_TO_STEP_DOWN: u32 = 3;
 const GOOD_TICKS_TO_STEP_UP: u32 = 30; // ~30 s of clean stats
 
 const STEP_DOWN_MULT: u32 = 75; // ×0.75
@@ -175,7 +180,11 @@ pub async fn run(
 }
 
 fn is_bad(s: &Snapshot) -> bool {
-    s.uplink.pkt_loss_rate > 0.01 || s.uplink.send_buf_pct > 0.7
+    // Instantaneous loss rate now (not lifetime). 0.3 % per second is
+    // already noticeable to the receiver — by 1 % we're already producing
+    // visible artifacts, so 0.3 % gives the adapter time to react before
+    // the link degrades visibly.
+    s.uplink.pkt_loss_rate > 0.003 || s.uplink.send_buf_pct > 0.7
 }
 
 /// "Good" requires not just a healthy link but also that the encoder is
@@ -187,8 +196,12 @@ fn is_bad(s: &Snapshot) -> bool {
 const UTIL_THRESHOLD: f32 = 0.85;
 
 fn is_good(s: &Snapshot) -> bool {
+    // Loss rate ≤ 0.05 % over the last second. With the new
+    // delta-based calculation this is a meaningful threshold —
+    // basically "the link is sending packets and almost none are
+    // being lost right now".
     let link_clean =
-        s.uplink.pkt_loss_rate < 0.001 && s.uplink.send_buf_pct < 0.3;
+        s.uplink.pkt_loss_rate < 0.0005 && s.uplink.send_buf_pct < 0.3;
     let utilising = if s.encoder.target_kbps == 0 {
         // No target set yet — treat as "we don't know", so allow step-up.
         true
