@@ -257,20 +257,38 @@ struct FlattenState {
     prev_dts: Option<gstreamer::ClockTime>,
 }
 
+/// Bump applied to a colliding PTS/DTS, chosen to survive the 90 kHz
+/// MPEG-TS PCR/PTS quantization downstream.
+///
+/// GStreamer PTS is in nanoseconds; `mpegtsmux` converts to 90 kHz ticks
+/// (≈ 11.1 µs each), so any bump smaller than one tick rounds away. A
+/// 1 ns bump (what I tried first) gets lost at the muxer and the wire
+/// still has duplicate timestamps. 1 ms is two orders of magnitude
+/// above the tick boundary — unambiguously distinct at every downstream
+/// element — and still small enough that the bumped frame stays well
+/// inside its 1/30 s (≈ 33 ms) inter-frame window, so the drift never
+/// catches up with the next "real" timestamp and never accumulates.
+///
+/// This is the same bump size ffmpeg's MPEG-TS muxer uses internally
+/// (one tick of the input timebase, which for FLV is 1 ms).
+const FLATTEN_BUMP_NS: u64 = 1_000_000;
+
 /// Install a pad probe on `element`'s src pad that rewrites each buffer's
-/// PTS and DTS so the output stream is strictly monotonically increasing.
-/// When the source emits a buffer with `dts <= prev_dts` (the DJI Fly
-/// duplicate-DTS pathology), the new DTS is set to `prev + 1 ns`; same
-/// for PTS. Increments `stats.pts_anomalies` on each correction so the
-/// dashboard surfaces how often the publisher is misbehaving.
+/// PTS and DTS so the output stream is strictly monotonically increasing
+/// at the MPEG-TS wire timebase, not just at GStreamer's nanosecond
+/// timebase. When the source emits a buffer with `dts <= prev_dts` (the
+/// DJI Fly duplicate-DTS pathology), the new DTS is set to
+/// `prev + FLATTEN_BUMP_NS`; same for PTS. Increments
+/// `stats.pts_anomalies` on each correction so the dashboard surfaces
+/// how often the publisher is misbehaving.
 ///
 /// This is the [`docs/plan.md`] §3.3 "MonotonicRebase" strategy. We
 /// don't need the full wallclock-anchored variant for our observed
 /// failure mode: the drone's frame *rate* is correct, only its
 /// *spacing* between consecutive frames sporadically collapses to
-/// zero. Bumping by 1 ns preserves the average rate (no drift) while
-/// giving every buffer a unique timestamp downstream elements can
-/// reorder against.
+/// zero. Bumping the colliding buffer preserves the average rate (no
+/// drift accumulates across frames) while giving every buffer a unique
+/// timestamp downstream elements can reorder against.
 fn attach_flatten_probe(element: &gstreamer::Element, stats: Arc<StatsState>) {
     let Some(src) = element.static_pad("src") else {
         tracing::error!("flatten probe: element has no src pad");
@@ -280,7 +298,7 @@ fn attach_flatten_probe(element: &gstreamer::Element, stats: Arc<StatsState>) {
         prev_pts: None,
         prev_dts: None,
     }));
-    let one_ns = gstreamer::ClockTime::from_nseconds(1);
+    let bump = gstreamer::ClockTime::from_nseconds(FLATTEN_BUMP_NS);
 
     src.add_probe(gstreamer::PadProbeType::BUFFER, move |_pad, info| {
         let Some(gstreamer::PadProbeData::Buffer(ref mut buf)) = info.data else {
@@ -293,7 +311,7 @@ fn attach_flatten_probe(element: &gstreamer::Element, stats: Arc<StatsState>) {
         if let Some(dts) = buf_mut.dts() {
             if let Some(prev) = s.prev_dts {
                 if dts <= prev {
-                    buf_mut.set_dts(Some(prev + one_ns));
+                    buf_mut.set_dts(Some(prev + bump));
                     bumped = true;
                 }
             }
@@ -302,7 +320,7 @@ fn attach_flatten_probe(element: &gstreamer::Element, stats: Arc<StatsState>) {
         if let Some(pts) = buf_mut.pts() {
             if let Some(prev) = s.prev_pts {
                 if pts <= prev {
-                    buf_mut.set_pts(Some(prev + one_ns));
+                    buf_mut.set_pts(Some(prev + bump));
                     bumped = true;
                 }
             }
