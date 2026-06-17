@@ -263,35 +263,43 @@ fn make(factory: &str, name: &str) -> Result<gstreamer::Element> {
 }
 
 /// Which branch a tee-queue lives on. Drives the queue's size + leakiness
-/// policy. Sized for stability on a Starlink uplink: the uplink queue is
-/// deep enough to absorb a multi-second SRT stall without dropping at the
-/// encoder; the preview queue leaks downstream so a slow browser cannot
-/// stall the raw tee (which would then stall the uplink encoder).
+/// policy. Both raw-side queues are `leaky=downstream`: the raw-NV12 tee
+/// has two consumers (the main encoder and the preview encoder), and if
+/// either one stalls briefly we'd rather drop raw frames on its branch
+/// than block the tee — which would freeze both branches in lockstep.
 #[derive(Clone, Copy)]
 enum BranchKind {
-    /// Raw NV12 feeding the main encoder. Shallow + non-leaky — buffers
-    /// here are large and the encoder eats them at line rate.
+    /// Raw NV12 feeding the main encoder. Deep + leaky-downstream: an
+    /// encoder hiccup (IDR encode burst, rate-control window, iGPU
+    /// contention) drops raw frames on this branch only and lets the
+    /// preview keep flowing. Without leaky-downstream, a brief vah265enc
+    /// pause backpressures the tee, which freezes both encoders together
+    /// and looks externally like wild bitrate oscillation.
     UplinkPreEnc,
     /// Encoded HEVC/AV1/H.264 feeding mpegtsmux + srtsink. Deep + non-leaky:
     /// we'd rather grow this queue than push the encoder into frame drops
     /// during a brief SRT pause. The matching SRT `latency`/`peerlatency`
     /// makes the receiver tolerate the resulting jitter.
     Uplink,
-    /// Raw NV12 feeding the downscaled preview encode. Shallow + leaky-
-    /// downstream so a slow browser tab is the only thing punished if it
-    /// can't keep up — the uplink chain is unaffected.
+    /// Raw NV12 feeding the downscaled preview encode. Deep + leaky-
+    /// downstream: same logic as `UplinkPreEnc` — a slow x264 encode
+    /// drops frames on its own branch instead of stalling the tee.
     Preview,
 }
 
 fn make_queue_for_branch(name: &str, kind: BranchKind) -> Result<gstreamer::Element> {
     let (max_buffers, max_bytes, max_time_ns, leaky_downstream) = match kind {
-        BranchKind::UplinkPreEnc => (8u32, 0u32, 0u64, false),
+        // 60 buffers ≈ 2 s of 30 fps raw NV12 (~3 MB each at 1080p, so
+        // ~180 MB worst case). Sized to absorb a multi-IDR encoder pause
+        // without ever blocking the upstream tee.
+        BranchKind::UplinkPreEnc => (60u32, 0u32, 2 * gstreamer::ClockTime::SECOND.nseconds(), true),
         // ~200 buffers ≈ 6 s of 30 fps; bound also by time so a stall in
         // bytes-heavy keyframes doesn't run away. We sized this against the
         // 5 s SRT latency window — the queue should be able to absorb a
         // handover-length stall without overflowing into encoder drops.
         BranchKind::Uplink => (200u32, 0u32, 6 * gstreamer::ClockTime::SECOND.nseconds(), false),
-        BranchKind::Preview => (8u32, 0u32, 0u64, true),
+        // 30 buffers ≈ 1 s of raw NV12 at 360p (~330 KB each, ~10 MB total).
+        BranchKind::Preview => (30u32, 0u32, gstreamer::ClockTime::SECOND.nseconds(), true),
     };
     let q = gstreamer::ElementFactory::make("queue")
         .name(name)
