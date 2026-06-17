@@ -24,31 +24,24 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:1935", env = "BUMPS_RTMP_LISTEN")]
     rtmp_listen: String,
 
-    /// SRT output URI (caller mode, e.g. AWS receiver).
+    /// SRT output URI. Pass `srt://host:port` and stability defaults are
+    /// appended automatically (8 s latency, 100 % retransmit overhead,
+    /// `maxbw` = 3 × bitrate, 25 MB socket buffers, 30 s peer-idle).
     ///
-    /// Default bakes in the params recommended for Starlink uplink with
-    /// stability prioritised over latency:
-    /// - `latency=5000` / `peerlatency=5000` — 5s receive buffer both sides,
-    ///   wide enough to ride out the ~2s Starlink satellite handovers plus
-    ///   ARQ retransmits without losing frames.
-    /// - `oheadbw=50` — 50% retransmit overhead, vs. the 25% libsrt default
-    ///   that's thin for lossy links.
-    /// - `maxbw=6000000` — pace at 6 Mbps, conservative ceiling for Starlink
-    ///   Mini that leaves headroom for retransmits below the link limit.
-    /// - `streamid=drone` — identifier, useful for MediaConnect/relay logs.
-    ///
-    /// Override the whole thing for your real receiver.
+    /// If you include any `?param=value` of your own, the URI is used
+    /// verbatim — nothing is appended. Use that when talking to a
+    /// receiver that needs specific values.
     #[arg(
         long,
-        default_value = "srt://127.0.0.1:9999?mode=caller&latency=5000&peerlatency=5000&oheadbw=50&maxbw=6000000&streamid=drone",
+        default_value = "srt://127.0.0.1:9999",
         env = "BUMPS_SRT_URI"
     )]
     srt_uri: String,
 
-    /// Encoder target bitrate in kbps. 5000 sits comfortably below the
-    /// `maxbw=6000000` SRT pacing so the encoder + uplink never fight on
-    /// burst.
-    #[arg(long, default_value_t = 5000, env = "BUMPS_BITRATE_KBPS")]
+    /// Encoder target bitrate in kbps. The default SRT URI's `maxbw` is
+    /// derived from this (3 × bitrate) so the encoder and the path never
+    /// disagree on the peak allowed rate.
+    #[arg(long, default_value_t = 8000, env = "BUMPS_BITRATE_KBPS")]
     bitrate_kbps: u32,
 
     /// Encoder GOP size in frames (≈ 1s at 30fps when set to 30). Short
@@ -64,9 +57,11 @@ struct Args {
     /// - `x264`     → `speed-preset` (slower preset = better quality)
     ///
     /// Higher = better image at the same bitrate target, more CPU/iGPU cost
-    /// and slightly more encode latency. 0.85 is a good "live but pretty"
-    /// point; drop to 0.5 if you need headroom; raise to 1.0 for max quality.
-    #[arg(long, default_value_t = 0.85, env = "BUMPS_QUALITY")]
+    /// and slightly more encode latency. 0.6 (default) is the stability
+    /// sweet spot: the encoder always meets its frame deadlines so the
+    /// pipeline never stalls. Bump to 0.8+ only when you've confirmed the
+    /// iGPU has headroom to spare.
+    #[arg(long, default_value_t = 0.6, env = "BUMPS_QUALITY")]
     quality: f32,
 
     /// Which video encoder to use.
@@ -106,10 +101,13 @@ struct Args {
     #[arg(long, env = "BUMPS_NO_PING", default_value_t = false)]
     no_ping: bool,
 
-    /// Disable adaptive bitrate. The encoder stays at `--bitrate-kbps`
-    /// regardless of SRT health.
-    #[arg(long, env = "BUMPS_NO_ADAPT", default_value_t = false)]
-    no_adapt: bool,
+    /// Enable adaptive bitrate. With this flag on, the encoder's bitrate
+    /// is automatically stepped up and down based on observed SRT loss
+    /// and send-buffer fullness. Off by default — for a stable stream
+    /// you almost always want a fixed bitrate that matches your relay's
+    /// configured ceiling, not a target that moves under your feet.
+    #[arg(long, env = "BUMPS_ADAPT", default_value_t = false)]
+    adapt: bool,
 
     /// Adaptive bitrate floor. The adapter never drops below this even on
     /// heavy loss. Defaults to 50 % of `--bitrate-kbps` — gives the adapter
@@ -196,7 +194,7 @@ async fn main() -> Result<()> {
         frame_tx: frame_tx.clone(),
     };
 
-    let adapt_enabled = !args.no_adapt;
+    let adapt_enabled = args.adapt;
     let adapt_min_kbps = args
         .min_bitrate_kbps
         .unwrap_or((args.bitrate_kbps / 2).max(1000));
@@ -204,8 +202,13 @@ async fn main() -> Result<()> {
         .max_bitrate_kbps
         .unwrap_or((args.bitrate_kbps * 12 / 10).max(args.bitrate_kbps + 500));
 
+    let resolved_srt_uri = finalise_srt_uri(&args.srt_uri, args.bitrate_kbps);
+    if resolved_srt_uri != args.srt_uri {
+        tracing::info!(uri = %resolved_srt_uri, "srt: appended stability defaults to bare URI");
+    }
+
     let pipeline_cfg = pipeline::Config {
-        srt_uri: args.srt_uri.clone(),
+        srt_uri: resolved_srt_uri.clone(),
         bitrate_kbps: args.bitrate_kbps,
         // Align the encoder's VBV ceiling with the adapter's ceiling so the
         // two agree on the maximum bitrate that may actually be requested.
@@ -283,7 +286,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         rtmp = %args.rtmp_listen,
         web  = %args.web_listen,
-        srt  = %args.srt_uri,
+        srt  = %resolved_srt_uri,
         "endpoints up; dashboard at http://{}/", args.web_listen
     );
 
@@ -299,6 +302,41 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// If `uri` has no query string, append a set of known-good stability
+/// defaults derived from `bitrate_kbps`. If it already has `?…` params,
+/// return it untouched so the caller's explicit values win.
+///
+/// Defaults applied to a bare `srt://host:port`:
+/// - `mode=caller` — outbound to a listener (e.g. MediaConnect / srt-live-transmit).
+/// - `latency=8000` / `peerlatency=8000` — generous receive buffer that
+///   absorbs multi-second Starlink handovers plus ARQ retransmits.
+/// - `oheadbw=100` — 100 % retransmit overhead allowed. Tells SRT it may
+///   use up to as much bandwidth again as the input for retransmits.
+/// - `inputbw = bitrate_kbps × 1000` and `maxbw = bitrate_kbps × 3000` —
+///   3× headroom over the encoder's average target. Wide enough to ride
+///   out CBR-HEVC IDR-frame bursts and the retransmit budget on top.
+/// - `rcvbuf=25000000`, `sndbuf=25000000` — 25 MB socket buffers, sized
+///   for `maxbw × latency / 8`.
+/// - `peeridletimeo=30000` — 30 s before SRT declares the peer dead
+///   (default 5 s would tear connections during longer stalls).
+/// - `streamid=drone` — convenience label for MediaConnect logs.
+fn finalise_srt_uri(uri: &str, bitrate_kbps: u32) -> String {
+    if uri.contains('?') {
+        return uri.to_string();
+    }
+    let inputbw = bitrate_kbps as u64 * 1000;
+    let maxbw = bitrate_kbps as u64 * 3000;
+    format!(
+        "{uri}?mode=caller\
+         &latency=8000&peerlatency=8000\
+         &oheadbw=100\
+         &inputbw={inputbw}&maxbw={maxbw}\
+         &rcvbuf=25000000&sndbuf=25000000\
+         &peeridletimeo=30000\
+         &streamid=drone"
+    )
 }
 
 /// An empty snapshot used to seed the watch channel before the collector ticks.
@@ -320,7 +358,7 @@ fn empty_snapshot(args: &Args) -> stats::Snapshot {
             nominal_kbps: args.bitrate_kbps,
             actual_kbps: 0.0,
             frames_out: 0,
-            adapt_enabled: !args.no_adapt,
+            adapt_enabled: args.adapt,
             min_kbps: args
                 .min_bitrate_kbps
                 .unwrap_or((args.bitrate_kbps / 2).max(1000)),

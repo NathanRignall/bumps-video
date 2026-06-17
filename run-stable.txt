@@ -1,15 +1,22 @@
-# bumps-pipe — absorb-anything stability profile
-# CBR encode at a flat 8 Mbps; adapter off so the rate truly never moves.
-# ~8-10s glass-to-glass latency, eats Starlink handovers + lossy bursts.
-
-# Sender (field laptop)
+# bumps-pipe — simple stable invocation
+#
+# Sender. SRT params (latency, oheadbw, maxbw, buffers, etc.) are baked
+# into the binary; pass just `srt://host:port`. The encoder runs in CBR
+# at the bitrate you set and the adapter is off by default.
 cargo run --release -- \
   --encoder va-hevc \
-  --no-adapt \
   --bitrate-kbps 8000 \
-  --quality 0.6 \
-  --gop-size 30 \
-  --srt-uri 'srt://3.11.124.82:9999?mode=caller&latency=8000&peerlatency=8000&oheadbw=100&inputbw=8000000&maxbw=16000000&rcvbuf=25000000&sndbuf=25000000&peeridletimeo=30000&streamid=drone'
+  --srt-uri 'srt://3.11.124.82:9999'
 
-# Viewer (e.g. ffplay, VLC, OBS media source)
+# Viewer (ffplay / VLC / OBS media source)
 srt://3.11.124.82:9998?mode=caller&latency=8000&peerlatency=8000&rcvbuf=25000000&peeridletimeo=30000
+
+# Notes
+# - Defaults baked in: gop-size=30 (1s), quality=0.6 (encoder always
+#   meets frame deadlines), adapter OFF, 8s SRT latency, 25 MB buffers.
+# - Want a different bitrate? Just change --bitrate-kbps. The SRT URI's
+#   maxbw is auto-set to 3× the bitrate so the encoder + path never
+#   disagree about peak headroom.
+# - Want adaptive bitrate (auto step down on loss)? Add --adapt.
+# - MediaConnect relay must be sized for the peak: set the source's
+#   `max_bitrate` to at least 3× your `--bitrate-kbps` in terraform.

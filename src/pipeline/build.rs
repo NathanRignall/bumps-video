@@ -4,7 +4,6 @@
 //! appsrc (video/x-flv)
 //!   → flvdemux  (dynamic src pad → linked on pad-added)
 //!   → h264parse
-//!   → identity (placeholder for the timestamp flattener — pass-through in v1)
 //!   → avdec_h264
 //!   → videoconvert
 //!   → video/x-raw,format=NV12
@@ -68,10 +67,6 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
 
     let flvdemux = make("flvdemux", "demux")?;
     let h264parse = make("h264parse", "parse_h264")?;
-
-    // Placeholder for the timestamp flattener (Phase 4). Pass-through for now.
-    let flatten = make("identity", "flatten")?;
-
     let avdec = make("avdec_h264", "dec")?;
     let convert = make("videoconvert", "convert")?;
     let caps_raw = gstreamer::ElementFactory::make("capsfilter")
@@ -139,7 +134,6 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
             appsrc.upcast_ref::<gstreamer::Element>(),
             &flvdemux,
             &h264parse,
-            &flatten,
             &avdec,
             &convert,
             &caps_raw,
@@ -173,7 +167,6 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
 
     gstreamer::Element::link_many([
         &h264parse,
-        &flatten,
         &avdec,
         &convert,
         &caps_raw,
@@ -684,6 +677,13 @@ fn build_encoder(cfg: &Config) -> Result<EncoderBuilt> {
             let encoder = gstreamer::ElementFactory::make("vah265enc")
                 .name("enc")
                 .property("bitrate", cfg.bitrate_kbps)
+                // `cpb-size` is the HRD buffer in kbits. Pinning it to one
+                // second of bitrate forces the encoder to comply with CBR
+                // over a 1 s sliding window — without this the VA encoder
+                // picks a multi-second default and lets the instantaneous
+                // rate swing far above the target, which is precisely the
+                // pattern that overflowed MediaConnect's max-bitrate cap.
+                .property("cpb-size", cfg.bitrate_kbps)
                 .property("key-int-max", cfg.gop_size)
                 .property("target-usage", qsv_target_usage(q))
                 .property_from_str("rate-control", "cbr")
@@ -704,6 +704,7 @@ fn build_encoder(cfg: &Config) -> Result<EncoderBuilt> {
             let encoder = gstreamer::ElementFactory::make("vaav1enc")
                 .name("enc")
                 .property("bitrate", cfg.bitrate_kbps)
+                .property("cpb-size", cfg.bitrate_kbps)
                 .property("key-int-max", cfg.gop_size)
                 .property("target-usage", target_usage)
                 .property_from_str("rate-control", "cbr")
