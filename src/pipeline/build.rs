@@ -113,6 +113,15 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
         .name("uplink")
         .property("uri", &cfg.srt_uri)
         .property("wait-for-connection", false)
+        // sync=false: do *not* wait for the pipeline clock to catch up to
+        // each buffer's PTS before sending. With RTMP-sourced PTS (from
+        // the publisher's FLV tag timestamps) the clock-wait holds packets
+        // until wallclock matches PTS, then dumps them in a burst — which
+        // arrives at the receiver as the SRT TSBPD delivery window cycles
+        // (0 / target / 0 / target every `?latency=` ms). For live caller
+        // mode we want srtsink to push as soon as the encoder produces;
+        // SRT's own `maxbw` does the network pacing.
+        .property("sync", false)
         .build()
         .context("srtsink")?;
 
