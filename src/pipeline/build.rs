@@ -399,12 +399,22 @@ fn build_preview_branch(
         .build()
         .context("h264parse (preview)")?;
 
+    // Force Annex-B byte-stream output for the browser. WebCodecs is
+    // configured *without* a `description` argument on the JS side, which
+    // means the spec requires Annex-B framing — x264enc + h264parse will
+    // otherwise happily negotiate AVCC with appsink (no preference) and
+    // the browser will silently fail to decode any frame.
+    let appsink_caps = gstreamer::Caps::builder("video/x-h264")
+        .field("stream-format", "byte-stream")
+        .field("alignment", "au")
+        .build();
     let appsink = gstreamer::ElementFactory::make("appsink")
         .name("preview")
         .property("emit-signals", true)
         .property("sync", false)
         .property("max-buffers", 4u32)
         .property("drop", true)
+        .property("caps", &appsink_caps)
         .build()
         .context("appsink (preview) factory")?
         .downcast::<AppSink>()
@@ -650,16 +660,25 @@ fn build_encoder(cfg: &Config) -> Result<EncoderBuilt> {
         }
         EncoderKind::VaHevc => {
             // VA-API HEVC via gst-plugins-bad's `va` plugin. Same Intel iGPU
-            // as QSV, accessed via libva. The `va` plugin's rate-control
-            // model is different from QSV: there's no `max-bitrate`
-            // property; instead the `bitrate` value is the cap and
-            // `target-percentage` (if present) controls the average.
+            // as QSV, accessed via libva.
+            //
+            // We deliberately run this in **CBR**, not VBR. The VA-API
+            // rate-control model treats VBR's `bitrate` field as a peak
+            // burst ceiling and lets the actual rate swing widely below
+            // it — which causes two stability problems on an SRT uplink:
+            //   1. Bursts above the negotiated `maxbw` overflow SRT's send
+            //      buffer in short spikes, producing gray/pixelated frames
+            //      at the receiver.
+            //   2. The send-buffer spikes look like congestion to our
+            //      adapter, which then oscillates the target up and down.
+            // CBR pins the encoder to `cfg.bitrate_kbps` and pads with
+            // filler when needed so SRT pacing is predictable.
             let encoder = gstreamer::ElementFactory::make("vah265enc")
                 .name("enc")
-                .property("bitrate", cfg.max_bitrate_kbps)
+                .property("bitrate", cfg.bitrate_kbps)
                 .property("key-int-max", cfg.gop_size)
                 .property("target-usage", qsv_target_usage(q))
-                .property_from_str("rate-control", "vbr")
+                .property_from_str("rate-control", "cbr")
                 .build()
                 .context(
                     "vah265enc factory — provided by gst-plugins-bad's `va` \
@@ -669,15 +688,17 @@ fn build_encoder(cfg: &Config) -> Result<EncoderBuilt> {
             Ok(EncoderBuilt { encoder, parser })
         }
         EncoderKind::VaAv1 => {
-            // VA-API AV1. Same caveat about AV1 encode being heavier than
-            // HEVC; mirror the QSV clamp on target-usage.
+            // VA-API AV1. Same CBR rationale as VaHevc above. Also clamp
+            // target-usage at 3 — AV1 encode is heavier than HEVC, and
+            // a slower target-usage at 1080p risks the encoder missing
+            // frame deadlines.
             let target_usage = qsv_target_usage(q).max(3);
             let encoder = gstreamer::ElementFactory::make("vaav1enc")
                 .name("enc")
-                .property("bitrate", cfg.max_bitrate_kbps)
+                .property("bitrate", cfg.bitrate_kbps)
                 .property("key-int-max", cfg.gop_size)
                 .property("target-usage", target_usage)
-                .property_from_str("rate-control", "vbr")
+                .property_from_str("rate-control", "cbr")
                 .build()
                 .context(
                     "vaav1enc factory — provided by gst-plugins-bad's `va` \
