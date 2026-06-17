@@ -36,7 +36,20 @@ case "$SRC" in
     SRC_DESC="SMPTE bars 1920x1080@30 (synthetic)"
     ;;
   rtmp)
-    SRC_ARGS=(-listen 1 -i "rtmp://0.0.0.0:1935/live/drone")
+    # `-probesize` + `-analyzeduration` give ffmpeg enough headroom to
+    # identify the FLV stream before declaring it un-decodable; the DJI
+    # Fly publisher can take 1–2 s after connect before the SPS/PPS land.
+    # `-fflags +genpts+discardcorrupt` regenerates PTS when the source's
+    # timestamps are wonky (the entire reason bumps-pipe exists) and
+    # silently drops any NAL units the decoder can't parse instead of
+    # failing the whole input.
+    SRC_ARGS=(
+      -fflags +genpts+discardcorrupt
+      -probesize 10000000
+      -analyzeduration 10000000
+      -listen 1
+      -i "rtmp://0.0.0.0:1935/live/drone"
+    )
     SRC_DESC="RTMP listener on 0.0.0.0:1935/live/drone — point DJI Fly at this"
     ;;
   *)
@@ -76,6 +89,7 @@ exec ffmpeg \
   -hide_banner \
   -loglevel info \
   "${SRC_ARGS[@]}" \
+  -map 0:v:0 \
   -c:v libx265 \
   -preset ultrafast \
   -tune zerolatency \
