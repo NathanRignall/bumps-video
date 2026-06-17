@@ -52,6 +52,11 @@ pub struct DownlinkStats {
     pub bitrate_kbps: f32,
     pub last_frame_age_ms: Option<u32>,
     pub session_uptime_s: Option<f32>,
+    /// How many buffers the timestamp flattener has had to rewrite to
+    /// keep PTS/DTS monotonic. Indicator of a misbehaving publisher
+    /// (DJI Fly emits duplicate-DTS pairs on roughly every other frame;
+    /// expect this to grow at ~15/s for a 30fps source).
+    pub pts_anomalies: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,6 +170,12 @@ pub struct StatsState {
     pub enc_bytes_out: AtomicU64,
     pub enc_frames_out: AtomicU64,
 
+    /// Number of buffers whose PTS/DTS the timestamp flattener had to
+    /// rewrite to maintain monotonicity. Incremented by the pad probe in
+    /// `pipeline::build::attach_flatten_probe`. Useful as a "how broken is
+    /// the publisher" indicator; on a clean source it stays at 0.
+    pub pts_anomalies: AtomicU64,
+
     // ── preview ────────────────────────────────────────────────────────────
     pub preview_clients: AtomicU32,
     pub preview_sent_frames: AtomicU64,
@@ -228,6 +239,7 @@ impl StatsState {
             session_started_us: AtomicU64::new(0),
             enc_bytes_out: AtomicU64::new(0),
             enc_frames_out: AtomicU64::new(0),
+            pts_anomalies: AtomicU64::new(0),
             preview_clients: AtomicU32::new(0),
             preview_sent_frames: AtomicU64::new(0),
             preview_sent_bytes: AtomicU64::new(0),

@@ -166,6 +166,7 @@ pub async fn run(state: Arc<StatsState>, cfg: CollectorConfig, tx: watch::Sender
             bitrate_kbps: down_bitrate_kbps_ewma,
             last_frame_age_ms,
             session_uptime_s,
+            pts_anomalies: state.pts_anomalies.load(Ordering::Relaxed),
         };
 
         let dynamic_target = state.adapt_target_kbps.load(Ordering::Relaxed);

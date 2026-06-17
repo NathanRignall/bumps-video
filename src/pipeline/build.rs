@@ -23,7 +23,7 @@
 //! browser cannot starve the uplink.
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -67,6 +67,14 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
 
     let flvdemux = make("flvdemux", "demux")?;
     let h264parse = make("h264parse", "parse_h264")?;
+    // Timestamp flattener: DJI Fly emits H.264 frames with duplicate DTS
+    // pairs (two consecutive frames share a DTS every ~500 ms). Encoders
+    // and mpegtsmux either stall or re-order on duplicate DTS, which is
+    // the root cause of every "AWS stream is pulsing" symptom. Mirror the
+    // monotonification ffmpeg's MPEG-TS muxer does internally — clamp
+    // each buffer's DTS/PTS to `prev + 1 ns` when the source emits a
+    // collision.
+    attach_flatten_probe(&h264parse, cfg.stats.clone());
     let avdec = make("avdec_h264", "dec")?;
     let convert = make("videoconvert", "convert")?;
     let caps_raw = gstreamer::ElementFactory::make("capsfilter")
@@ -239,6 +247,73 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
         encoder,
         preview_encoder,
     })
+}
+
+/// State for [`attach_flatten_probe`]. Tracks the last PTS/DTS the probe
+/// emitted so each subsequent buffer can be compared and, if needed,
+/// bumped to maintain strict monotonicity.
+struct FlattenState {
+    prev_pts: Option<gstreamer::ClockTime>,
+    prev_dts: Option<gstreamer::ClockTime>,
+}
+
+/// Install a pad probe on `element`'s src pad that rewrites each buffer's
+/// PTS and DTS so the output stream is strictly monotonically increasing.
+/// When the source emits a buffer with `dts <= prev_dts` (the DJI Fly
+/// duplicate-DTS pathology), the new DTS is set to `prev + 1 ns`; same
+/// for PTS. Increments `stats.pts_anomalies` on each correction so the
+/// dashboard surfaces how often the publisher is misbehaving.
+///
+/// This is the [`docs/plan.md`] §3.3 "MonotonicRebase" strategy. We
+/// don't need the full wallclock-anchored variant for our observed
+/// failure mode: the drone's frame *rate* is correct, only its
+/// *spacing* between consecutive frames sporadically collapses to
+/// zero. Bumping by 1 ns preserves the average rate (no drift) while
+/// giving every buffer a unique timestamp downstream elements can
+/// reorder against.
+fn attach_flatten_probe(element: &gstreamer::Element, stats: Arc<StatsState>) {
+    let Some(src) = element.static_pad("src") else {
+        tracing::error!("flatten probe: element has no src pad");
+        return;
+    };
+    let state = Arc::new(Mutex::new(FlattenState {
+        prev_pts: None,
+        prev_dts: None,
+    }));
+    let one_ns = gstreamer::ClockTime::from_nseconds(1);
+
+    src.add_probe(gstreamer::PadProbeType::BUFFER, move |_pad, info| {
+        let Some(gstreamer::PadProbeData::Buffer(ref mut buf)) = info.data else {
+            return gstreamer::PadProbeReturn::Ok;
+        };
+        let mut s = state.lock().expect("flatten state poisoned");
+        let buf_mut = buf.make_mut();
+
+        let mut bumped = false;
+        if let Some(dts) = buf_mut.dts() {
+            if let Some(prev) = s.prev_dts {
+                if dts <= prev {
+                    buf_mut.set_dts(Some(prev + one_ns));
+                    bumped = true;
+                }
+            }
+            s.prev_dts = buf_mut.dts();
+        }
+        if let Some(pts) = buf_mut.pts() {
+            if let Some(prev) = s.prev_pts {
+                if pts <= prev {
+                    buf_mut.set_pts(Some(prev + one_ns));
+                    bumped = true;
+                }
+            }
+            s.prev_pts = buf_mut.pts();
+        }
+        if bumped {
+            stats.pts_anomalies.fetch_add(1, Ordering::Relaxed);
+        }
+
+        gstreamer::PadProbeReturn::Ok
+    });
 }
 
 fn attach_encoder_probe(encoder: &gstreamer::Element, stats: Arc<StatsState>) {

@@ -351,6 +351,7 @@ fn empty_snapshot(args: &Args) -> stats::Snapshot {
             bitrate_kbps: 0.0,
             last_frame_age_ms: None,
             session_uptime_s: None,
+            pts_anomalies: 0,
         },
         encoder: EncoderStats {
             codec: format!("{}", args.encoder),

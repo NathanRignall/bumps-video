@@ -131,6 +131,7 @@
         <dt>bytes in</dt>  <dd id="d-bytes">–</dd>
         <dt>last frame</dt><dd id="d-age">–</dd>
         <dt>session up</dt><dd id="d-uptime">–</dd>
+        <dt title="Buffers the flattener had to rewrite to keep PTS/DTS monotonic. DJI Fly typically pushes this ~15/s.">pts fixes</dt><dd id="d-pts">–</dd>
       </dl>
       <canvas class="spark" id="sp-down" width="200" height="28"></canvas>
     </div>
@@ -367,6 +368,7 @@ function applyStats(s) {
     ? '–'
     : s.downlink.last_frame_age_ms + ' ms';
   $('d-uptime').textContent  = fmtSecs(s.downlink.session_uptime_s);
+  $('d-pts').textContent     = s.downlink.pts_anomalies.toLocaleString();
   pushSeries('down', s.downlink.bitrate_kbps);
   drawSpark($('sp-down'), series.down, '#7be0a4');
 
