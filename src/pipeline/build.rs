@@ -5,6 +5,7 @@
 //!   → flvdemux  (dynamic src pad → linked on pad-added)
 //!   → h264parse
 //!   → avdec_h264
+//!   → videorate                    (normalises irregular source cadence)
 //!   → videoconvert
 //!   → video/x-raw,format=NV12
 //!   → tee_raw ─┬─→ queue (main, leaky=no)
@@ -72,10 +73,26 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
     // and mpegtsmux either stall or re-order on duplicate DTS, which is
     // the root cause of every "AWS stream is pulsing" symptom. Mirror the
     // monotonification ffmpeg's MPEG-TS muxer does internally — clamp
-    // each buffer's DTS/PTS to `prev + 1 ns` when the source emits a
+    // each buffer's DTS/PTS to `prev + 1 ms` when the source emits a
     // collision.
     attach_flatten_probe(&h264parse, cfg.stats.clone());
     let avdec = make("avdec_h264", "dec")?;
+    // Frame-rate normaliser. The flattener fixes DTS *collisions* but the
+    // drone can still deliver frames at irregular wall-clock spacing
+    // (FLV-tag bursts when the publisher's WiFi briefly stalls) and with
+    // sporadic small PTS gaps that the flattener doesn't touch.
+    // `videorate` consumes the irregular input and emits a perfectly
+    // uniform PTS cadence to the encoder by duplicating-or-dropping
+    // frames, which means: encoder workload becomes constant, no IDR
+    // burst gets mis-timed against the wall clock, and the receiver
+    // sees an even frame rate. `skip-to-first=true` avoids filling the
+    // gap between pipeline start and the first real frame with synthetic
+    // duplicates.
+    let videorate = gstreamer::ElementFactory::make("videorate")
+        .name("rate_smooth")
+        .property("skip-to-first", true)
+        .build()
+        .context("videorate")?;
     let convert = make("videoconvert", "convert")?;
     let caps_raw = gstreamer::ElementFactory::make("capsfilter")
         .name("caps_nv12")
@@ -152,6 +169,7 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
             &flvdemux,
             &h264parse,
             &avdec,
+            &videorate,
             &convert,
             &caps_raw,
             &tee_raw,
@@ -185,6 +203,7 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
     gstreamer::Element::link_many([
         &h264parse,
         &avdec,
+        &videorate,
         &convert,
         &caps_raw,
         &tee_raw,
