@@ -25,13 +25,23 @@
 # `scripts/aws-relay.sh start|stop` helpers to only run it during flights.
 
 locals {
-  flow_name         = "bumps-video-drone"
-  source_name       = "drone-srt-in"
-  output_name       = "home-srt-out"
-  srt_input_port    = 9999
-  srt_output_port   = 9998
-  srt_latency_ms    = 2500
-  srt_max_bitrate   = 8000000 # bits/s — matches the ?maxbw= in the URI
+  flow_name       = "bumps-video-drone"
+  source_name     = "drone-srt-in"
+  output_name     = "home-srt-out"
+  srt_input_port  = 9999
+  srt_output_port = 9998
+  # Match the sender's `?latency=` so MediaConnect's receive buffer is sized
+  # for the same window the sender thinks it has. SRT negotiates to the
+  # higher of the two ends, but pinning explicitly avoids any
+  # implementation that caps negotiation lower.
+  srt_latency_ms = 8000
+  # Must accommodate peak instantaneous rate, NOT the encoder's average
+  # target. With CBR HEVC at 8 Mbps target, IDR-frame bursts routinely
+  # reach 12-16 Mbps. Adding ~50 % headroom on top of the sender's
+  # `?maxbw=16000000` lets MediaConnect receive the SRT retransmits too
+  # without ever rate-limiting. Undersizing this is what was producing
+  # jittery / pixelated playback at the receiver even on a fibre uplink.
+  srt_max_bitrate   = 24000000
   availability_zone = "eu-west-2a"
 }
 
