@@ -572,9 +572,10 @@ impl ActiveSession {
             cfg.stats.clone(),
         );
 
-        // Publish srtsink + encoders to the stats state so the collector can
-        // poll srtsink, the adapter can write to the uplink encoder, and the
-        // WS handler can force IDRs on the preview encoder.
+        // Publish srtsink + encoder to the stats state so the collector can
+        // poll srtsink and the adapter / WS handler can write properties on
+        // (and force IDRs through) the encoder. The preview now shares the
+        // single encode, so there's only one encoder handle to publish.
         {
             let mut g = cfg.stats.srtsink.lock().expect("srtsink mutex");
             *g = Some(built.srtsink.clone());
@@ -584,12 +585,15 @@ impl ActiveSession {
             *g = Some(built.encoder.clone());
         }
         {
+            // Preview encoder is the same element as the uplink encoder
+            // now (single-encode architecture). Keep the slot in sync so
+            // `request_preview_keyframe` still targets a live element.
             let mut g = cfg
                 .stats
                 .preview_encoder
                 .lock()
                 .expect("preview_encoder mutex");
-            *g = built.preview_encoder.clone();
+            *g = Some(built.encoder.clone());
         }
 
         built

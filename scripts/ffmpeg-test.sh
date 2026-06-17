@@ -60,8 +60,11 @@ case "$SRC" in
     ;;
 esac
 
-INPUTBW=$((BITRATE * 1000))
-MAXBW=$((BITRATE * 3 * 1000))
+# SRT inputbw/maxbw are in BYTES per second, not bits — `kbps × 125` is
+# the right conversion. Writing them as bits gave SRT 8× the intended
+# bandwidth budget and produced runaway retransmit storms on lossy links.
+INPUTBW=$((BITRATE * 125))      # bytes/sec
+MAXBW=$((BITRATE * 250))        # 2× headroom, bytes/sec
 # Note: `peeridletimeo` is a libsrt option but ffmpeg's URL parser doesn't
 # whitelist it — leaving it in produces "Option not found" at startup.
 # Default peer-idle is 5 s which is fine for a smoke test.

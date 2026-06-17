@@ -314,11 +314,16 @@ async fn main() -> Result<()> {
 ///   absorbs multi-second Starlink handovers plus ARQ retransmits.
 /// - `oheadbw=100` — 100 % retransmit overhead allowed. Tells SRT it may
 ///   use up to as much bandwidth again as the input for retransmits.
-/// - `inputbw = bitrate_kbps × 1000` and `maxbw = bitrate_kbps × 3000` —
-///   3× headroom over the encoder's average target. Wide enough to ride
-///   out CBR-HEVC IDR-frame bursts and the retransmit budget on top.
-/// - `rcvbuf=25000000`, `sndbuf=25000000` — 25 MB socket buffers, sized
-///   for `maxbw × latency / 8`.
+/// - `inputbw = bitrate_kbps × 125` and `maxbw = bitrate_kbps × 250` —
+///   2× headroom over the encoder's average target. CRITICALLY: libsrt's
+///   `inputbw` and `maxbw` are in **BYTES per second**, not bits per
+///   second (despite the SI-style naming). `kbps × 125 = bytes/sec`
+///   (= `kbps × 1000 / 8`). Treating them as bits/sec — which is what we
+///   did originally and what most callers naturally write — gives SRT
+///   permission to send at 8× the intended cap, which on a lossy link
+///   manifests as runaway retransmits (60+ Mbps on a 3 Mbps target).
+/// - `rcvbuf=25000000`, `sndbuf=25000000` — 25 MB socket buffers (in
+///   bytes; OS-level buffer sizes are always bytes).
 /// - `peeridletimeo=30000` — 30 s before SRT declares the peer dead
 ///   (default 5 s would tear connections during longer stalls).
 /// - `streamid=drone` — convenience label for MediaConnect logs.
@@ -326,8 +331,8 @@ fn finalise_srt_uri(uri: &str, bitrate_kbps: u32) -> String {
     if uri.contains('?') {
         return uri.to_string();
     }
-    let inputbw = bitrate_kbps as u64 * 1000;
-    let maxbw = bitrate_kbps as u64 * 3000;
+    let inputbw = bitrate_kbps as u64 * 125; // bytes/sec
+    let maxbw = bitrate_kbps as u64 * 250;   // 2× headroom, bytes/sec
     format!(
         "{uri}?mode=caller\
          &latency=8000&peerlatency=8000\

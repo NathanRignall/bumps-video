@@ -41,12 +41,10 @@ pub(super) struct Built {
     /// Caller stashes this in `StatsState::srtsink` so the collector can poll.
     pub srtsink: gstreamer::Element,
     /// Caller stashes this in `StatsState::encoder` so the adapter can write
-    /// the `bitrate` property at runtime.
+    /// the `bitrate` property at runtime, and so the WS handler can force
+    /// IDR keyframes (which now serves both the SRT uplink and the browser
+    /// preview, since they share the single encode).
     pub encoder: gstreamer::Element,
-    /// Caller stashes this in `StatsState::preview_encoder` so the WS
-    /// handler can force IDRs on the preview side. `None` when the preview
-    /// branch is disabled in config.
-    pub preview_encoder: Option<gstreamer::Element>,
 }
 
 pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
@@ -107,16 +105,14 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
 
     let EncoderBuilt { encoder, parser } = build_encoder(cfg)?;
 
-    // Raw-NV12 tee: feeds the main (uplink) encode chain and, optionally, a
-    // separate downscaled preview encode chain. Splitting *before* the main
-    // encoder means the preview cost is decoupled from the uplink bitrate.
-    let tee_raw = make("tee", "tee_raw")?;
+    // Encoded-bitstream tee. Single encode feeds two destinations: the
+    // uplink (mpegtsmux + srtsink) and the browser preview (appsink). At
+    // 3 Mbps HEVC the cost of having the browser decode the production
+    // stream is negligible on a modern machine — Mac Safari/Chrome do it
+    // in hardware — so spending iGPU + CPU on a separate downscaled
+    // encode just to feed the preview pane no longer pays for itself.
+    let tee_encoded = make("tee", "tee_encoded")?;
 
-    // Main branch (raw → encoder → parser → uplink queue → mpegts → srtsink).
-    // Keep `q_main_in` shallow — the main encoder is the consumer of the raw
-    // tee and it processes at line rate, so a deep queue here would only hide
-    // pre-encode contention.
-    let queue_main = make_queue_for_branch("q_main_in", BranchKind::UplinkPreEnc)?;
     // SRT branch: leaky=no so a saturated SRT path backpressures the encoder
     // (which then drops whole frames at the source, intentionally) rather than
     // silently shredding the MPEG-TS bytestream mid-packet. Bigger than the
@@ -155,11 +151,13 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
     // must be very cheap — just a couple of atomic adds.
     attach_encoder_probe(&encoder, cfg.stats.clone());
 
-    // Optional preview branch.
+    // Optional preview branch — just queue + appsink. The encoded HEVC
+    // (or H.264 / AV1, depending on `--encoder`) bitstream is tapped
+    // directly off the main tee.
     let preview_branch = cfg
         .preview
         .as_ref()
-        .map(|sinks| build_preview_branch(sinks.clone(), cfg.stats.clone()))
+        .map(|sinks| build_preview_branch(sinks.clone(), cfg.encoder, cfg.stats.clone()))
         .transpose()?;
 
     // ── assemble ──────────────────────────────────────────────────────────
@@ -172,10 +170,9 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
             &videorate,
             &convert,
             &caps_raw,
-            &tee_raw,
-            &queue_main,
             &encoder,
             &parser,
+            &tee_encoded,
             &queue_srt,
             &mpegts,
             &srtsink,
@@ -184,14 +181,7 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
 
     if let Some(b) = &preview_branch {
         pipeline
-            .add_many([
-                &b.queue,
-                &b.scale,
-                &b.caps_preview,
-                &b.encoder,
-                &b.parser,
-                b.appsink.upcast_ref::<gstreamer::Element>(),
-            ])
+            .add_many([&b.queue, b.appsink.upcast_ref::<gstreamer::Element>()])
             .context("pipeline add_many (preview branch)")?;
     }
 
@@ -206,29 +196,23 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
         &videorate,
         &convert,
         &caps_raw,
-        &tee_raw,
+        &encoder,
+        &parser,
+        &tee_encoded,
     ])
-    .context("link decode→raw chain")?;
+    .context("link decode→encode→tee chain")?;
 
-    // tee_raw → queue_main → encoder → parser → queue_srt → mpegts → srtsink
-    link_tee_branch(&tee_raw, &queue_main).context("link tee_raw → q_main")?;
-    gstreamer::Element::link_many([&queue_main, &encoder, &parser, &queue_srt, &mpegts, &srtsink])
+    // tee_encoded → queue_srt → mpegts → srtsink
+    link_tee_branch(&tee_encoded, &queue_srt).context("link tee_encoded → q_srt")?;
+    gstreamer::Element::link_many([&queue_srt, &mpegts, &srtsink])
         .context("link uplink branch")?;
 
-    // tee_raw → queue_prev → videoscale → caps → preview_enc → parse → appsink
+    // tee_encoded → queue_prev → appsink (one-pass tap of the encoded stream)
     if let Some(b) = &preview_branch {
-        link_tee_branch(&tee_raw, &b.queue).context("link tee_raw → q_preview")?;
-        gstreamer::Element::link_many([
-            &b.queue,
-            &b.scale,
-            &b.caps_preview,
-            &b.encoder,
-            &b.parser,
-        ])
-        .context("link preview encode chain")?;
-        b.parser
+        link_tee_branch(&tee_encoded, &b.queue).context("link tee_encoded → q_preview")?;
+        b.queue
             .link(b.appsink.upcast_ref::<gstreamer::Element>())
-            .context("link preview_parser → appsink")?;
+            .context("link q_preview → appsink")?;
     }
 
     // flvdemux dynamic-pad bridge.
@@ -257,14 +241,11 @@ pub(super) fn build_pipeline(cfg: &Config) -> Result<Built> {
         }
     });
 
-    let preview_encoder = preview_branch.as_ref().map(|b| b.encoder.clone());
-
     Ok(Built {
         pipeline,
         appsrc,
         srtsink,
         encoder,
-        preview_encoder,
     })
 }
 
@@ -381,39 +362,33 @@ fn make(factory: &str, name: &str) -> Result<gstreamer::Element> {
 /// has two consumers (the main encoder and the preview encoder), and if
 /// either one stalls briefly we'd rather drop raw frames on its branch
 /// than block the tee — which would freeze both branches in lockstep.
+/// Which branch a tee-queue lives on. Drives the queue's size + leakiness
+/// policy. Both queues sit on the *encoded-bitstream* tee, so buffer sizes
+/// here are bytes-of-bitstream, not raw frames.
 #[derive(Clone, Copy)]
 enum BranchKind {
-    /// Raw NV12 feeding the main encoder. Deep + leaky-downstream: an
-    /// encoder hiccup (IDR encode burst, rate-control window, iGPU
-    /// contention) drops raw frames on this branch only and lets the
-    /// preview keep flowing. Without leaky-downstream, a brief vah265enc
-    /// pause backpressures the tee, which freezes both encoders together
-    /// and looks externally like wild bitrate oscillation.
-    UplinkPreEnc,
     /// Encoded HEVC/AV1/H.264 feeding mpegtsmux + srtsink. Deep + non-leaky:
     /// we'd rather grow this queue than push the encoder into frame drops
     /// during a brief SRT pause. The matching SRT `latency`/`peerlatency`
     /// makes the receiver tolerate the resulting jitter.
     Uplink,
-    /// Raw NV12 feeding the downscaled preview encode. Deep + leaky-
-    /// downstream: same logic as `UplinkPreEnc` — a slow x264 encode
-    /// drops frames on its own branch instead of stalling the tee.
+    /// Encoded bitstream feeding the browser appsink. Shallow + leaky-
+    /// downstream: a slow browser tab is the only thing punished if it
+    /// can't keep up — the uplink chain is unaffected.
     Preview,
 }
 
 fn make_queue_for_branch(name: &str, kind: BranchKind) -> Result<gstreamer::Element> {
     let (max_buffers, max_bytes, max_time_ns, leaky_downstream) = match kind {
-        // 60 buffers ≈ 2 s of 30 fps raw NV12 (~3 MB each at 1080p, so
-        // ~180 MB worst case). Sized to absorb a multi-IDR encoder pause
-        // without ever blocking the upstream tee.
-        BranchKind::UplinkPreEnc => (60u32, 0u32, 2 * gstreamer::ClockTime::SECOND.nseconds(), true),
         // ~200 buffers ≈ 6 s of 30 fps; bound also by time so a stall in
         // bytes-heavy keyframes doesn't run away. We sized this against the
         // 5 s SRT latency window — the queue should be able to absorb a
         // handover-length stall without overflowing into encoder drops.
         BranchKind::Uplink => (200u32, 0u32, 6 * gstreamer::ClockTime::SECOND.nseconds(), false),
-        // 30 buffers ≈ 1 s of raw NV12 at 360p (~330 KB each, ~10 MB total).
-        BranchKind::Preview => (30u32, 0u32, gstreamer::ClockTime::SECOND.nseconds(), true),
+        // ~60 encoded buffers ≈ 2 s of 30 fps. Bounded also in time so a
+        // browser that vanishes (tab hidden) drops cleanly rather than
+        // accumulating frames.
+        BranchKind::Preview => (60u32, 0u32, 2 * gstreamer::ClockTime::SECOND.nseconds(), true),
     };
     let q = gstreamer::ElementFactory::make("queue")
         .name(name)
@@ -442,101 +417,68 @@ fn link_tee_branch(tee: &gstreamer::Element, downstream: &gstreamer::Element) ->
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Preview branch — separate downscaled encode dedicated to browser preview.
+// Preview branch — taps the encoded uplink bitstream and emits it to the
+// browser via WebSocket. No separate encode: at our nominal 3 Mbps target
+// (and even at 8 Mbps), decoding the production stream in a modern browser
+// is trivially cheap thanks to hardware HEVC decode on Mac (Safari + Chrome)
+// and Windows. The dashboard preview is now at full uplink resolution and
+// quality, with zero extra encode load on the field laptop.
 //
-// Why a second encode rather than reusing the uplink bitstream:
-//   * Preview cost stays bounded regardless of uplink bitrate. At 10 Mbps
-//     uplink the browser was previously asked to decode 10 Mbps of HEVC,
-//     which dragged the dashboard's frame rate down.
-//   * Browser is fed H.264 baseline-class video, which every WebCodecs
-//     implementation hardware-decodes — no surprise software fallback.
-//   * 640×360 @ ~700 kbps is sufficient for the preview pane and costs
-//     near-nothing on the CPU side (x264 ultrafast).
+// The browser must support the active codec — that depends on `--encoder`:
+//   * vah265enc / qsvh265enc / vtenc_h265 → hev1.*  (HEVC)
+//   * x264enc                              → avc1.* (H.264)
+//   * vaav1enc / qsvav1enc                 → av01.* (AV1)
+// `init_from_caps` reads h26{4,5}parse / av1parse src caps to build the
+// WebCodecs codec string at runtime.
 // ────────────────────────────────────────────────────────────────────────────
-
-const PREVIEW_WIDTH: i32 = 640;
-const PREVIEW_HEIGHT: i32 = 360;
-const PREVIEW_BITRATE_KBPS: u32 = 700;
-const PREVIEW_GOP_FRAMES: u32 = 30;
 
 struct PreviewBranch {
     queue: gstreamer::Element,
-    scale: gstreamer::Element,
-    caps_preview: gstreamer::Element,
-    encoder: gstreamer::Element,
-    parser: gstreamer::Element,
     appsink: AppSink,
 }
 
 fn build_preview_branch(
     sinks: PreviewSinks,
+    encoder_kind: EncoderKind,
     stats: Arc<StatsState>,
 ) -> Result<PreviewBranch> {
     let queue = make_queue_for_branch("q_preview", BranchKind::Preview)?;
 
-    let scale = make("videoscale", "preview_scale")?;
-    // `add-borders=false` avoids spending bytes on letterbox bars when the
-    // source isn't 16:9; the canvas in the dashboard scales-to-fit anyway.
-    scale.set_property("add-borders", false);
-
-    let caps_preview = gstreamer::ElementFactory::make("capsfilter")
-        .name("caps_preview")
-        .property(
-            "caps",
-            gstreamer::Caps::builder("video/x-raw")
-                .field("format", "NV12")
-                .field("width", PREVIEW_WIDTH)
-                .field("height", PREVIEW_HEIGHT)
-                .build(),
-        )
-        .build()
-        .context("caps_preview")?;
-
-    // Always use software x264 for the preview encode, regardless of the
-    // uplink encoder choice. Reasons:
-    //   * Universal browser compatibility via WebCodecs avc1.* codec string.
-    //   * x264 ultrafast at 360p is trivially cheap (~1% of a single CPU).
-    //   * Keeps the iGPU dedicated to the uplink encode (no contention
-    //     between QSV/VA sessions).
-    let encoder = gstreamer::ElementFactory::make("x264enc")
-        .name("preview_enc")
-        .property("bitrate", PREVIEW_BITRATE_KBPS)
-        .property("key-int-max", PREVIEW_GOP_FRAMES)
-        .property("bframes", 0u32)
-        .property_from_str("speed-preset", "ultrafast")
-        .property_from_str("tune", "zerolatency")
-        .build()
-        .context(
-            "x264enc factory for preview — provided by gst-plugins-ugly. \
-             Should ship in every devShell variant; this is the same plugin \
-             used for `--encoder x264`.",
-        )?;
-
-    let parser = gstreamer::ElementFactory::make("h264parse")
-        .name("preview_parse")
-        // config-interval=1 inserts SPS/PPS roughly every second alongside
-        // each keyframe, so a freshly-connected browser tab can configure
-        // its VideoDecoder without waiting for the next GOP.
-        .property("config-interval", 1i32)
-        .build()
-        .context("h264parse (preview)")?;
-
     // Force Annex-B byte-stream output for the browser. WebCodecs is
     // configured *without* a `description` argument on the JS side, which
-    // means the spec requires Annex-B framing — x264enc + h264parse will
-    // otherwise happily negotiate AVCC with appsink (no preference) and
-    // the browser will silently fail to decode any frame.
-    let appsink_caps = gstreamer::Caps::builder("video/x-h264")
-        .field("stream-format", "byte-stream")
-        .field("alignment", "au")
-        .build();
-    let appsink = gstreamer::ElementFactory::make("appsink")
+    // means the spec requires Annex-B framing. h26{4,5}parse will
+    // otherwise happily negotiate AVCC/HVCC with appsink (no preference)
+    // and the browser silently fails to decode any frame. AV1 has no
+    // AVCC equivalent — its parser only produces one format — so we
+    // don't constrain the caps in that case.
+    let appsink_caps = match encoder_kind {
+        EncoderKind::QsvHevc | EncoderKind::VtHevc | EncoderKind::VaHevc => {
+            Some(
+                gstreamer::Caps::builder("video/x-h265")
+                    .field("stream-format", "byte-stream")
+                    .field("alignment", "au")
+                    .build(),
+            )
+        }
+        EncoderKind::X264 => Some(
+            gstreamer::Caps::builder("video/x-h264")
+                .field("stream-format", "byte-stream")
+                .field("alignment", "au")
+                .build(),
+        ),
+        EncoderKind::QsvAv1 | EncoderKind::VaAv1 => None,
+    };
+
+    let mut appsink_builder = gstreamer::ElementFactory::make("appsink")
         .name("preview")
         .property("emit-signals", true)
         .property("sync", false)
         .property("max-buffers", 4u32)
-        .property("drop", true)
-        .property("caps", &appsink_caps)
+        .property("drop", true);
+    if let Some(caps) = appsink_caps.as_ref() {
+        appsink_builder = appsink_builder.property("caps", caps);
+    }
+    let appsink = appsink_builder
         .build()
         .context("appsink (preview) factory")?
         .downcast::<AppSink>()
@@ -544,14 +486,7 @@ fn build_preview_branch(
 
     install_preview_callbacks(&appsink, sinks, stats);
 
-    Ok(PreviewBranch {
-        queue,
-        scale,
-        caps_preview,
-        encoder,
-        parser,
-        appsink,
-    })
+    Ok(PreviewBranch { queue, appsink })
 }
 
 fn install_preview_callbacks(
@@ -622,9 +557,9 @@ fn install_preview_callbacks(
     );
 }
 
-/// The preview branch is always H.264 (see `build_preview_branch`), so this
-/// reads h264parse src caps and returns the matching `avc1.*` WebCodecs
-/// codec string.
+/// The preview now taps the main encoded bitstream, so the codec depends
+/// on the configured uplink encoder. Read the caps structure name to pick
+/// the right WebCodecs codec-string builder (`avc1.*` / `hev1.*` / `av01.*`).
 fn init_from_caps(caps: &gstreamer::CapsRef) -> Option<InitInfo> {
     let s = caps.structure(0)?;
     let width: i32 = s.get("width").ok()?;
@@ -634,9 +569,33 @@ fn init_from_caps(caps: &gstreamer::CapsRef) -> Option<InitInfo> {
         .map(|f| (f.numer() as u32, f.denom() as u32))
         .unwrap_or((30, 1));
 
-    let profile: String = s.get("profile").unwrap_or_else(|_| "baseline".into());
-    let level: String = s.get("level").unwrap_or_else(|_| "3.1".into());
-    let codec = h264_codec_string(&profile, &level);
+    let codec = match s.name().as_str() {
+        "video/x-h264" => {
+            let profile: String = s.get("profile").unwrap_or_else(|_| "baseline".into());
+            let level: String = s.get("level").unwrap_or_else(|_| "3.1".into());
+            h264_codec_string(&profile, &level)
+        }
+        "video/x-h265" => {
+            let profile: String = s.get("profile").unwrap_or_else(|_| "main".into());
+            let tier: String = s.get("tier").unwrap_or_else(|_| "main".into());
+            let level: String = s.get("level").unwrap_or_else(|_| "3.1".into());
+            hevc_codec_string(&profile, &tier, &level)
+        }
+        "video/x-av1" => {
+            let profile: String = s.get("profile").unwrap_or_else(|_| "main".into());
+            let tier: String = s.get("tier").unwrap_or_else(|_| "main".into());
+            let level: String = s.get("level").unwrap_or_else(|_| "4.0".into());
+            let bit_depth: u32 = s
+                .get::<u32>("bit-depth")
+                .or_else(|_| s.get::<i32>("bit-depth").map(|v| v as u32))
+                .unwrap_or(8);
+            av1_codec_string(&profile, &tier, &level, bit_depth)
+        }
+        other => {
+            tracing::warn!(caps = %other, "preview: unrecognised caps structure name");
+            return None;
+        }
+    };
 
     Some(InitInfo {
         codec,
@@ -645,6 +604,50 @@ fn init_from_caps(caps: &gstreamer::CapsRef) -> Option<InitInfo> {
         fps_num,
         fps_den,
     })
+}
+
+/// Construct a WebCodecs HEVC codec string from h265parse caps fields.
+/// Format: `hev1.<profile_idc>.6.<tier_flag><level_num>.B0`.
+fn hevc_codec_string(profile: &str, tier: &str, level: &str) -> String {
+    let profile_idc = match profile {
+        "main" => 1u8,
+        "main-10" => 2,
+        "main-still-picture" => 3,
+        _ => 1,
+    };
+    let tier_flag = if tier.eq_ignore_ascii_case("high") { 'H' } else { 'L' };
+    let level_num = parse_hevc_level(level).unwrap_or(93);
+    format!("hev1.{profile_idc}.6.{tier_flag}{level_num}.B0")
+}
+
+/// HEVC level "X.Y" → general_level_idc (X*30 + Y*3). e.g. "3.1" → 93.
+fn parse_hevc_level(level: &str) -> Option<u32> {
+    let mut parts = level.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some(major * 30 + minor * 3)
+}
+
+/// WebCodecs AV1 codec string per the av1-isobmff spec:
+/// `av01.<profile>.<seq_level_idx_0><seq_tier_0>.<bit_depth>`.
+fn av1_codec_string(profile: &str, tier: &str, level: &str, bit_depth: u32) -> String {
+    let profile_idc: u32 = match profile {
+        "main" => 0,
+        "high" => 1,
+        "professional" => 2,
+        _ => 0,
+    };
+    let seq_level_idx = av1_seq_level_idx(level).unwrap_or(8);
+    let tier_char = if tier.eq_ignore_ascii_case("high") { 'H' } else { 'M' };
+    format!("av01.{profile_idc}.{seq_level_idx:02}{tier_char}.{bit_depth:02}")
+}
+
+/// AV1 level "X.Y" → `seq_level_idx_0` (each major level packs four indexes).
+fn av1_seq_level_idx(level: &str) -> Option<u32> {
+    let mut parts = level.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some(major.saturating_sub(2) * 4 + minor)
 }
 
 /// Construct a WebCodecs H.264 codec string. Format: `avc1.<idc><compat><level>`.
