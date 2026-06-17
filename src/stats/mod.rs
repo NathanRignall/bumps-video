@@ -182,6 +182,11 @@ pub struct StatsState {
     pub srtsink: Mutex<Option<gstreamer::Element>>,
     /// Same lifecycle as `srtsink`. The adapter writes `bitrate` on it.
     pub encoder: Mutex<Option<gstreamer::Element>>,
+    /// Same lifecycle as `srtsink`. The preview encoder is a separate
+    /// downscaled H.264 encode dedicated to the browser; we need a handle
+    /// on it to force IDRs when a WS client lags or first connects so the
+    /// browser can resume decode without waiting for the next natural GOP.
+    pub preview_encoder: Mutex<Option<gstreamer::Element>>,
 
     // ── adapter state ──────────────────────────────────────────────────────
     /// Current effective target bitrate in kbps. The adapter writes here on
@@ -231,6 +236,7 @@ impl StatsState {
             restarts: AtomicU32::new(0),
             srtsink: Mutex::new(None),
             encoder: Mutex::new(None),
+            preview_encoder: Mutex::new(None),
             adapt_target_kbps: AtomicU32::new(0),
             adapt_step_downs: AtomicU64::new(0),
             adapt_step_ups: AtomicU64::new(0),
@@ -261,20 +267,33 @@ impl StatsState {
         UplinkState::from_u8(self.uplink_state.load(Ordering::Relaxed))
     }
 
-    /// Ask the current encoder to emit an IDR keyframe on the next picture,
-    /// with VPS/SPS/PPS headers attached so a brand-new decoder can start
-    /// cleanly from it. No-op when there's no active pipeline.
+    /// Ask the current uplink encoder to emit an IDR keyframe on the next
+    /// picture, with VPS/SPS/PPS headers attached so the SRT receiver can
+    /// resync from it. No-op when there's no active pipeline.
     ///
-    /// All three of our encoders (`qsvh265enc`, `vtenc_h265`, `x264enc`)
-    /// respond to the GStreamer upstream `force-key-unit` event.
+    /// All of our encoders respond to the GStreamer upstream
+    /// `force-key-unit` event.
     pub fn request_keyframe(&self) {
-        use gstreamer::prelude::*;
-        let Ok(guard) = self.encoder.lock() else { return };
-        let Some(enc) = guard.as_ref() else { return };
-        let Some(pad) = enc.static_pad("sink") else { return };
-        let event = gstreamer_video::UpstreamForceKeyUnitEvent::builder()
-            .all_headers(true)
-            .build();
-        pad.send_event(event);
+        force_key_unit(&self.encoder);
     }
+
+    /// Same as [`Self::request_keyframe`] but targets the preview encoder
+    /// — used to recover a freshly-connected browser tab without disturbing
+    /// the uplink encoder's GOP cadence.
+    pub fn request_preview_keyframe(&self) {
+        force_key_unit(&self.preview_encoder);
+    }
+}
+
+/// Send an upstream `force-key-unit` event into whichever encoder is
+/// currently parked in the given mutex slot. No-op when slot is empty.
+fn force_key_unit(slot: &Mutex<Option<gstreamer::Element>>) {
+    use gstreamer::prelude::*;
+    let Ok(guard) = slot.lock() else { return };
+    let Some(enc) = guard.as_ref() else { return };
+    let Some(pad) = enc.static_pad("sink") else { return };
+    let event = gstreamer_video::UpstreamForceKeyUnitEvent::builder()
+        .all_headers(true)
+        .build();
+    pad.send_event(event);
 }

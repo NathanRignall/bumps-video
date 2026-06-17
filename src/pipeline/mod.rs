@@ -572,8 +572,9 @@ impl ActiveSession {
             cfg.stats.clone(),
         );
 
-        // Publish srtsink + encoder to the stats state so the collector can
-        // poll srtsink and the adapter can write to encoder.
+        // Publish srtsink + encoders to the stats state so the collector can
+        // poll srtsink, the adapter can write to the uplink encoder, and the
+        // WS handler can force IDRs on the preview encoder.
         {
             let mut g = cfg.stats.srtsink.lock().expect("srtsink mutex");
             *g = Some(built.srtsink.clone());
@@ -581,6 +582,14 @@ impl ActiveSession {
         {
             let mut g = cfg.stats.encoder.lock().expect("encoder mutex");
             *g = Some(built.encoder.clone());
+        }
+        {
+            let mut g = cfg
+                .stats
+                .preview_encoder
+                .lock()
+                .expect("preview_encoder mutex");
+            *g = built.preview_encoder.clone();
         }
 
         built
@@ -622,6 +631,11 @@ impl ActiveSession {
         let _ = self.pipeline.set_state(gstreamer::State::Null);
         *self.stats.srtsink.lock().expect("srtsink mutex") = None;
         *self.stats.encoder.lock().expect("encoder mutex") = None;
+        *self
+            .stats
+            .preview_encoder
+            .lock()
+            .expect("preview_encoder mutex") = None;
     }
 }
 

@@ -83,10 +83,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             state.stats.preview_clients.fetch_sub(1, Ordering::Relaxed);
             return;
         }
-        // Kick the encoder to emit a fresh keyframe so this client can start
-        // decoding immediately rather than waiting up to GOP-size frames for
-        // the next natural one.
-        state.stats.request_keyframe();
+        // Kick the *preview* encoder to emit a fresh keyframe so this
+        // client can start decoding immediately rather than waiting up to
+        // GOP-size frames for the next natural one. Uses the preview-side
+        // encoder so the uplink GOP cadence isn't disturbed every time a
+        // browser tab is opened.
+        state.stats.request_preview_keyframe();
     }
 
     // Send the current stats snapshot immediately so the dashboard has
@@ -121,8 +123,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(n, "ws client lagged on broadcast");
+                        // Browser fell behind — by the time it re-syncs to
+                        // the broadcast head we may be mid-GOP, which means
+                        // it cannot decode anything until the next keyframe.
+                        // Force one now so playback resumes within a frame
+                        // rather than within `gop_size` frames.
+                        tracing::warn!(n, "ws client lagged on broadcast; forcing preview keyframe");
                         state.stats.preview_dropped.fetch_add(n, Ordering::Relaxed);
+                        state.stats.request_preview_keyframe();
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -152,7 +160,12 @@ async fn handle_client_command(cmd: ClientMsg, state: &AppState) {
     use gstreamer::prelude::*;
     match cmd {
         ClientMsg::RequestKeyframe => {
+            // Operator-initiated → IDR both encoders. The uplink IDR helps
+            // the SRT receiver resync; the preview IDR helps the dashboard
+            // viewer resync. They're independent encoders now and we don't
+            // know which one the operator is rescuing, so do both.
             state.stats.request_keyframe();
+            state.stats.request_preview_keyframe();
             post_event(state, "operator_keyframe", serde_json::json!({})).await;
             tracing::info!("operator: request_keyframe");
         }

@@ -26,28 +26,36 @@ struct Args {
 
     /// SRT output URI (caller mode, e.g. AWS receiver).
     ///
-    /// Default bakes in the params recommended for Starlink uplink:
-    /// - `latency=2500` / `peerlatency=2500` — 2.5s receive buffer both sides,
-    ///   absorbs satellite handovers and ARQ retransmits.
+    /// Default bakes in the params recommended for Starlink uplink with
+    /// stability prioritised over latency:
+    /// - `latency=5000` / `peerlatency=5000` — 5s receive buffer both sides,
+    ///   wide enough to ride out the ~2s Starlink satellite handovers plus
+    ///   ARQ retransmits without losing frames.
     /// - `oheadbw=50` — 50% retransmit overhead, vs. the 25% libsrt default
     ///   that's thin for lossy links.
-    /// - `maxbw=8000000` — pace at 8 Mbps, the realistic Starlink Mini ceiling.
+    /// - `maxbw=6000000` — pace at 6 Mbps, conservative ceiling for Starlink
+    ///   Mini that leaves headroom for retransmits below the link limit.
     /// - `streamid=drone` — identifier, useful for MediaConnect/relay logs.
     ///
     /// Override the whole thing for your real receiver.
     #[arg(
         long,
-        default_value = "srt://127.0.0.1:9999?mode=caller&latency=2500&peerlatency=2500&oheadbw=50&maxbw=8000000&streamid=drone",
+        default_value = "srt://127.0.0.1:9999?mode=caller&latency=5000&peerlatency=5000&oheadbw=50&maxbw=6000000&streamid=drone",
         env = "BUMPS_SRT_URI"
     )]
     srt_uri: String,
 
-    /// Encoder target bitrate in kbps
+    /// Encoder target bitrate in kbps. 5000 sits comfortably below the
+    /// `maxbw=6000000` SRT pacing so the encoder + uplink never fight on
+    /// burst.
     #[arg(long, default_value_t = 5000, env = "BUMPS_BITRATE_KBPS")]
     bitrate_kbps: u32,
 
-    /// Encoder GOP size in frames (≈ 2s at 30fps when set to 60)
-    #[arg(long, default_value_t = 60, env = "BUMPS_GOP_SIZE")]
+    /// Encoder GOP size in frames (≈ 1s at 30fps when set to 30). Short
+    /// GOPs mean a lost keyframe causes at most one second of decode
+    /// failure on the receiver instead of two; for a Starlink path with
+    /// frequent handovers this is worth the few-percent bitrate overhead.
+    #[arg(long, default_value_t = 30, env = "BUMPS_GOP_SIZE")]
     gop_size: u32,
 
     /// Quality target on a 0.0–1.0 scale. Maps per encoder:
@@ -104,12 +112,16 @@ struct Args {
     no_adapt: bool,
 
     /// Adaptive bitrate floor. The adapter never drops below this even on
-    /// heavy loss. Defaults to 20 % of `--bitrate-kbps`.
+    /// heavy loss. Defaults to 50 % of `--bitrate-kbps` — gives the adapter
+    /// real headroom to back off when SRT loss starts before it ever has to
+    /// hit a hard floor.
     #[arg(long, env = "BUMPS_MIN_BITRATE_KBPS")]
     min_bitrate_kbps: Option<u32>,
 
     /// Adaptive bitrate ceiling. The adapter never raises above this even on
-    /// a perfect link. Defaults to 200 % of `--bitrate-kbps`.
+    /// a perfect link. Defaults to 120 % of `--bitrate-kbps` — matched to the
+    /// SRT `maxbw` so the encoder's VBV ceiling never bursts above what SRT
+    /// has agreed to pace.
     #[arg(long, env = "BUMPS_MAX_BITRATE_KBPS")]
     max_bitrate_kbps: Option<u32>,
 }
@@ -167,8 +179,13 @@ async fn main() -> Result<()> {
 
     // Preview channels: init via watch (latest cached for late-joining clients),
     // video via broadcast (fan-out to all open dashboards).
+    //
+    // Capacity 60 = ~2 s at 30fps. With a downscaled+low-bitrate preview
+    // encode this is enough to ride out brief WS-send hiccups while keeping
+    // recovery from a stall fast (less stale data in the queue when a client
+    // catches up).
     let (init_tx, init_rx) = tokio::sync::watch::channel(None);
-    let (frame_tx, _) = tokio::sync::broadcast::channel(120);
+    let (frame_tx, _) = tokio::sync::broadcast::channel(60);
 
     // Stats: collector publishes here, web/WS subscribes.
     let initial_snapshot = empty_snapshot(&args);
@@ -182,10 +199,10 @@ async fn main() -> Result<()> {
     let adapt_enabled = !args.no_adapt;
     let adapt_min_kbps = args
         .min_bitrate_kbps
-        .unwrap_or((args.bitrate_kbps / 5).max(500));
+        .unwrap_or((args.bitrate_kbps / 2).max(1000));
     let adapt_max_kbps = args
         .max_bitrate_kbps
-        .unwrap_or(args.bitrate_kbps.saturating_mul(2));
+        .unwrap_or((args.bitrate_kbps * 12 / 10).max(args.bitrate_kbps + 500));
 
     let pipeline_cfg = pipeline::Config {
         srt_uri: args.srt_uri.clone(),
@@ -306,10 +323,10 @@ fn empty_snapshot(args: &Args) -> stats::Snapshot {
             adapt_enabled: !args.no_adapt,
             min_kbps: args
                 .min_bitrate_kbps
-                .unwrap_or((args.bitrate_kbps / 5).max(500)),
+                .unwrap_or((args.bitrate_kbps / 2).max(1000)),
             max_kbps: args
                 .max_bitrate_kbps
-                .unwrap_or(args.bitrate_kbps.saturating_mul(2)),
+                .unwrap_or((args.bitrate_kbps * 12 / 10).max(args.bitrate_kbps + 500)),
             step_downs: 0,
             step_ups: 0,
             quality: args.quality,
